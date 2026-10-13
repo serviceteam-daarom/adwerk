@@ -77,23 +77,66 @@ function dims(bytes: Uint8Array, type: string) {
   } catch { /* onbekend */ }
   return { w: 1000, h: 1000 }
 }
+
+/* ---------- data-URL's en svg's robuust lezen ---------- */
+function parseDataUrl(src: string): { type: string; bytes: Uint8Array } | null {
+  const i = src.indexOf(',')
+  if (!src.startsWith('data:') || i < 0) return null
+  const meta = src.slice(5, i), body = src.slice(i + 1)
+  const type = (meta.split(';')[0] || 'text/plain').trim().toLowerCase()
+  if (/;base64/i.test(meta)) { try { return { type, bytes: Uint8Array.from(atob(body.replace(/\s+/g, '')), (c) => c.charCodeAt(0)) } } catch { return null } }
+  let text: string
+  try { text = decodeURIComponent(body) } catch { text = body }
+  return { type, bytes: new TextEncoder().encode(text) }
+}
+function normalizeSvg(text: string, longSide?: number): { svg: string; w: number; h: number } | null {
+  let s = text.replace(/^﻿/, '').trim()
+  const start = s.search(/<svg[\s>]/i)
+  if (start < 0) return null
+  s = s.slice(start)
+  s = s.replace(/<script[\s\S]*?<\/script>/gi, '').replace(/\son[a-z]+\s*=\s*("[^"]*"|'[^']*')/gi, '')
+  const open = s.match(/<svg\b[^>]*>/i)
+  if (!open) return null
+  let tag = open[0]
+  const attr = (n: string) => { const m = tag.match(new RegExp(`\\s${n}\\s*=\\s*("([^"]*)"|'([^']*)')`, 'i')); return m ? (m[2] ?? m[3]) : null }
+  const num = (v: string | null) => { if (!v || /%$/.test(v.trim())) return 0; const n = parseFloat(v); if (!isFinite(n) || n <= 0) return 0; const u = v.trim().replace(/^[-+]?[\d.]+(e[-+]?\d+)?/i, '').trim().toLowerCase(); return n * ({ pt: 4 / 3, pc: 16, mm: 3.7795, cm: 37.795, in: 96, em: 16, rem: 16 } as Record<string, number>)[u] || n }
+  const vb = (attr('viewBox') || '').trim().split(/[\s,]+/).map(Number)
+  const hasVb = vb.length === 4 && vb.every(isFinite) && vb[2] > 0 && vb[3] > 0
+  let w = num(attr('width')), h = num(attr('height'))
+  if (hasVb) { if (!w && !h) { w = vb[2]; h = vb[3] } else if (!w) w = h * vb[2] / vb[3]; else if (!h) h = w * vb[3] / vb[2] }
+  if (!w || !h) { w = w || 1000; h = h || 1000 }
+  const strip = (n: string) => { tag = tag.replace(new RegExp(`\\s${n}\\s*=\\s*("[^"]*"|'[^']*')`, 'i'), '') }
+  strip('width'); strip('height')
+  const extra: string[] = []
+  if (!hasVb) extra.push(`viewBox="0 0 ${+w.toFixed(3)} ${+h.toFixed(3)}"`)
+  if (!/\sxmlns\s*=/.test(tag)) extra.push('xmlns="http://www.w3.org/2000/svg"')
+  if (/xlink:/.test(s) && !/xmlns:xlink/.test(tag)) extra.push('xmlns:xlink="http://www.w3.org/1999/xlink"')
+  const k = longSide ? longSide / Math.max(w, h) : 1
+  const W = Math.round(w * k * 100) / 100, H = Math.round(h * k * 100) / 100
+  if (!/\spreserveAspectRatio\s*=/.test(tag) && !hasVb) extra.push('preserveAspectRatio="xMidYMid meet"')
+  tag = tag.replace(/^<svg\b/i, `<svg width="${W}" height="${H}" ${extra.join(' ')}`).replace(/\s+>$/, '>').replace(/\s{2,}/g, ' ')
+  s = s.replace(open[0], tag)
+  return { svg: s, w, h }
+}
+
+
 const b64 = (bytes: Uint8Array) => { let s = ''; for (let i = 0; i < bytes.length; i += 0x8000) s += String.fromCharCode(...bytes.subarray(i, i + 0x8000)); return btoa(s) }
 function loadImg(src: string) {
   if (!imgCache.has(src)) {
     imgCache.set(src, (async () => {
       let bytes: Uint8Array, type: string
       if (src.startsWith('data:')) {
-        const m = src.match(/^data:([^;,]+)(;base64)?,(.*)$/s)
-        if (!m) return null
-        type = m[1]
-        bytes = m[2] ? Uint8Array.from(atob(m[3]), (c) => c.charCodeAt(0)) : new TextEncoder().encode(decodeURIComponent(m[3]))
+        const d = parseDataUrl(src)
+        if (!d) return null
+        type = d.type; bytes = d.bytes
       } else {
         const r = await fetch(src)
         if (!r.ok) return null
         type = (r.headers.get('content-type') || '').split(';')[0] || (src.endsWith('.svg') ? 'image/svg+xml' : 'image/png')
         bytes = new Uint8Array(await r.arrayBuffer())
       }
-      if (/\.svg(\?|$)/i.test(src)) type = 'image/svg+xml'
+      if (/\.svg(\?|$)/i.test(src) || /^\s*(<\?xml|<svg)/i.test(new TextDecoder().decode(bytes.slice(0, 200)))) type = 'image/svg+xml'
+      if (type.includes('svg')) { const n = normalizeSvg(new TextDecoder().decode(bytes)); if (n) { bytes = new TextEncoder().encode(n.svg); return { uri: `data:image/svg+xml;base64,${b64(bytes)}`, w: n.w, h: n.h, svg: true } } }
       const d = dims(bytes, type)
       return { uri: `data:${type};base64,${b64(bytes)}`, w: d.w, h: d.h, svg: type.includes('svg') }
     })().catch(() => null))
@@ -312,8 +355,13 @@ async function renderImageGrid(src: string, maxSide: number): Promise<{ png: Uin
   return { png, w: W, h: H }
 }
 async function imageDims(src: string) { const im = await loadImg(src); return im ? { w: im.w, h: im.h } : null }
-
 // ===== SERVER-RENDER (einde) =====
+
+/** Probeert een svg te rasteren; geeft een foutmelding terug als dat niet lukt. */
+async function checkSvg(svg: string): Promise<string | null> {
+  await ensureWasm()
+  try { const r = new Resvg(svg, { fitTo: { mode: 'width', value: 64 }, font: { loadSystemFonts: false } }); r.render().asPng(); return null } catch (e) { return String((e as Error)?.message || e).slice(0, 200) }
+}
 
 
 const CORS = {
@@ -531,13 +579,7 @@ function imageSize(bytes: Uint8Array, type: string): { w: number; h: number } {
       if (chunk === 'VP8L') { const b = dv.getUint32(21, true); return { w: (b & 0x3fff) + 1, h: ((b >> 14) & 0x3fff) + 1 } }
       if (chunk === 'VP8 ') return { w: dv.getUint16(26, true) & 0x3fff, h: dv.getUint16(28, true) & 0x3fff }
     }
-    if (type.includes('svg')) {
-      const t = new TextDecoder().decode(bytes.slice(0, 4000))
-      const vb = t.match(/viewBox="\s*[-\d.]+[\s,]+[-\d.]+[\s,]+([\d.]+)[\s,]+([\d.]+)/)
-      if (vb) return { w: +vb[1], h: +vb[2] }
-      const w = t.match(/\swidth="([\d.]+)/), h = t.match(/\sheight="([\d.]+)/)
-      if (w && h) return { w: +w[1], h: +h[1] }
-    }
+    if (type.includes('svg')) { const n = normalizeSvg(new TextDecoder().decode(bytes)); if (n) return { w: n.w, h: n.h } }
   } catch { /* onbekend */ }
   return { w: 1000, h: 1000 }
 }
@@ -551,16 +593,28 @@ function safeUrl(u: string) {
 
 async function importImage(src: string, ctx: Ctx, name?: string, shared = false) {
   let bytes: Uint8Array, type: string
-  if (src.startsWith('data:')) {
-    const m = src.match(/^data:([^;,]+)(;base64)?,(.*)$/s)
-    if (!m) throw new Error('Ongeldige data-URL')
-    type = m[1]
-    bytes = m[2] ? Uint8Array.from(atob(m[3]), (c) => c.charCodeAt(0)) : new TextEncoder().encode(decodeURIComponent(m[3]))
+  src = src.trim()
+  if (/^(<\?xml|<svg|<!--)/i.test(src)) {
+    // ruwe svg-code
+    type = 'image/svg+xml'; bytes = new TextEncoder().encode(src)
+  } else if (src.startsWith('data:')) {
+    const d = parseDataUrl(src)
+    if (!d) throw new Error('Ongeldige data-URL. Gebruik data:image/png;base64,... of geef de svg-code direct mee (beginnend met <svg).')
+    type = d.type; bytes = d.bytes
   } else {
     const r = await fetch(safeUrl(src), { headers: { 'User-Agent': 'Mozilla/5.0 Adwerk' }, redirect: 'follow' })
     if (!r.ok) throw new Error(`Beeld ophalen mislukt (${r.status})`)
-    type = (r.headers.get('content-type') || 'image/png').split(';')[0]
+    type = (r.headers.get('content-type') || 'image/png').split(';')[0].toLowerCase()
     bytes = new Uint8Array(await r.arrayBuffer())
+  }
+  // svg herkennen aan de inhoud (servers sturen vaak text/plain, text/xml of octet-stream)
+  const head = new TextDecoder().decode(bytes.slice(0, 400)).replace(/^\uFEFF/, '').trimStart()
+  if (type.includes('svg') || /^(<\?xml[^>]*>\s*)?(<!--[\s\S]*?-->\s*)*(<!DOCTYPE[^>]*>\s*)?<svg[\s>]/i.test(head) || (/^<\?xml|^<svg/i.test(head) && /\.svg(\?|$)/i.test(src))) {
+    const n = normalizeSvg(new TextDecoder().decode(bytes))
+    if (!n) throw new Error('Dit is geen geldige svg: er staat geen <svg>-element in.')
+    const err = await checkSvg(n.svg)
+    if (err) throw new Error(`Deze svg kan niet getekend worden (${err}). Controleer of de code compleet is en alle tags gesloten zijn.`)
+    type = 'image/svg+xml'; bytes = new TextEncoder().encode(n.svg)
   }
   if (!type.startsWith('image/')) throw new Error('Dit is geen afbeelding')
   if (bytes.byteLength > 20 * 1024 * 1024) throw new Error('Afbeelding is groter dan 20 MB')
@@ -570,7 +624,7 @@ async function importImage(src: string, ctx: Ctx, name?: string, shared = false)
   if (error) throw new Error('Opslaan van de afbeelding mislukt')
   const url = db.storage.from('assets').getPublicUrl(path).data.publicUrl
   const size = imageSize(bytes, type)
-  const fileName = name || (src.startsWith('data:') ? `agent-beeld.${ext}` : decodeURIComponent(new URL(src).pathname.split('/').pop() || `beeld.${ext}`)).slice(0, 120)
+  const fileName = name || (src.startsWith('data:') || src.startsWith('<') ? `agent-beeld.${ext}` : decodeURIComponent(new URL(src).pathname.split('/').pop() || `beeld.${ext}`)).slice(0, 120)
   await db.from('assets').insert({ url, path, name: fileName, width: size.w, height: size.h, shared, owner_id: ctx.userId })
   return { url, ...size }
 }
@@ -805,14 +859,14 @@ const TOOLS: { name: string; description: string; inputSchema: { type: string; p
   { name: 'set_background', description: 'Achtergrond van een of alle formaten: effen kleur, kleurverloop of foto (URL wordt opgeslagen in Adwerk).', inputSchema: { type: 'object', properties: { design_id: DESIGN, frame_id: FRAME, type: { type: 'string', enum: ['solid', 'gradient', 'image'] }, color: S.str('Hex-kleur, bijv. #1B213B'), color2: S.str('Tweede kleur bij verloop'), angle: S.num('Hoek van het verloop in graden'), image_url: S.str('Foto-URL of data-URL bij type image') }, required: ['design_id'] } },
   { name: 'add_text', description: `Voegt een tekstblok toe. Lettertypes: ${FONTS.join(', ')} of een andere Google Font.`, inputSchema: { type: 'object', properties: { design_id: DESIGN, frame_id: FRAME, text: S.str('De tekst; \\n voor een nieuwe regel'), ...BOX, font_size: S.num('Lettergrootte in px'), font_family: S.str('Lettertype (standaard Poppins)'), font_weight: S.num('400, 500, 600, 700, 800 of 900'), color: S.str('Hex-kleur'), align: { type: 'string', enum: ['left', 'center', 'right'] }, line_height: S.num('Regelafstand, bijv. 1.15'), letter_spacing: S.num('Letterafstand in px'), uppercase: S.bool('Hoofdletters'), italic: S.bool('Cursief'), name: S.str('Laagnaam') }, required: ['design_id', 'text'] } },
   { name: 'add_shape', description: 'Voegt een vorm toe: rect, rounded, pill, ellipse, triangle, star, badge of line. Handig voor knoppen, vlakken en accenten.', inputSchema: { type: 'object', properties: { design_id: DESIGN, frame_id: FRAME, shape: { type: 'string', enum: ['rect', 'rounded', 'pill', 'ellipse', 'triangle', 'star', 'badge', 'line'] }, ...BOX, color: S.str('Vulkleur (hex)'), corner_radius: S.num('Afronding in px'), stroke_color: S.str('Randkleur'), stroke_width: S.num('Randdikte'), opacity: S.num('0 tot 1'), name: S.str('Laagnaam') }, required: ['design_id', 'shape'] } },
-  { name: 'add_image', description: 'Bekijk de foto eerst met view_image. Zet een afbeelding op het canvas vanaf een URL of data-URL. Het beeld wordt opgeslagen in de uploads van de gebruiker. Zonder breedte/hoogte past het beeld in de juiste verhouding. Met mask krijg je een vorm (circle, arch, oval, leaf, blob).', inputSchema: { type: 'object', properties: { design_id: DESIGN, frame_id: FRAME, image_url: S.str('URL of data-URL'), ...BOX, mask: { type: 'string', enum: ['none', 'circle', 'arch', 'oval', 'leaf', 'blob'] }, corner_radius: S.num('Afronding'), focus_x: S.num('Focuspunt in de foto 0 tot 1 (uit view_image), bijv. tussen de ogen'), focus_y: S.num('Focuspunt 0 tot 1'), name: S.str('Laagnaam') }, required: ['design_id', 'image_url'] } },
+  { name: 'add_image', description: 'Bekijk de foto eerst met view_image. Zet een afbeelding op het canvas vanaf een URL of data-URL. Het beeld wordt opgeslagen in de uploads van de gebruiker. Zonder breedte/hoogte past het beeld in de juiste verhouding. Met mask krijg je een vorm (circle, arch, oval, leaf, blob).', inputSchema: { type: 'object', properties: { design_id: DESIGN, frame_id: FRAME, image_url: S.str('URL, data-URL of svg-code (begint met <svg). Svg wordt automatisch opgeschoond, krijgt een vaste maat en wordt gecontroleerd.'), ...BOX, mask: { type: 'string', enum: ['none', 'circle', 'arch', 'oval', 'leaf', 'blob'] }, corner_radius: S.num('Afronding'), focus_x: S.num('Focuspunt in de foto 0 tot 1 (uit view_image), bijv. tussen de ogen'), focus_y: S.num('Focuspunt 0 tot 1'), name: S.str('Laagnaam') }, required: ['design_id', 'image_url'] } },
   { name: 'add_icon', description: 'Zet een icoon uit 200.000+ open iconen (Iconify) op het canvas. Zoek eerst met search_icons.', inputSchema: { type: 'object', properties: { design_id: DESIGN, frame_id: FRAME, icon: S.str('Iconify-id, bijv. "ph:shopping-cart-bold"'), x: BOX.x, y: BOX.y, size: S.num('Grootte in px'), color: S.str('Kleur (hex) voor eenkleurige iconen') }, required: ['design_id', 'icon'] } },
   { name: 'search_icons', description: 'Zoekt open iconen (Engelse zoekwoorden werken het best). Geeft Iconify-id\'s terug voor add_icon.', inputSchema: { type: 'object', properties: { query: S.str('Zoekwoord, bijv. cart, phone, arrow'), pack: S.str('Optioneel pack-prefix, bijv. ph, tabler, lucide, mdi, logos'), limit: S.num('Max aantal (standaard 30)') }, required: ['query'] } },
   { name: 'update_element', description: 'Past een element aan. Geef alleen de eigenschappen die veranderen, bijvoorbeeld {"x":120,"text":"Nu 20% korting","fill":"#EA5F39","fontSize":64}. Mogelijk: x, y, width, height, rotation, opacity, visible, locked, fill, stroke, strokeWidth, cornerRadius, text, fontFamily, fontSize, fontWeight, italic, underline, align, lineHeight, letterSpacing, uppercase, src, mask, cropZoom, cropX, cropY, flipX, flipY, name, shadow {enabled,color,blur,x,y,opacity}.', inputSchema: { type: 'object', properties: { design_id: DESIGN, element_id: S.str('Id van het element'), props: { type: 'object', description: 'De te wijzigen eigenschappen' } }, required: ['design_id', 'element_id', 'props'] } },
   { name: 'delete_element', description: 'Verwijdert een element.', inputSchema: { type: 'object', properties: { design_id: DESIGN, element_id: S.str('Id van het element') }, required: ['design_id', 'element_id'] } },
   { name: 'arrange_element', description: 'Verandert de laagvolgorde: front (helemaal voor), back (helemaal achter), forward of backward (één stap).', inputSchema: { type: 'object', properties: { design_id: DESIGN, element_id: S.str('Id'), position: { type: 'string', enum: ['front', 'back', 'forward', 'backward'] } }, required: ['design_id', 'element_id', 'position'] } },
   { name: 'animate_element', description: `Animatie voor een element (HTML5, GIF en video). In en uit: ${IN_ANIMS.join(', ')}. Nadruk (herhalend): ${EMPH_ANIMS.join(', ')}. Delay en duration in seconden.`, inputSchema: { type: 'object', properties: { design_id: DESIGN, element_id: S.str('Id'), in: { type: 'object', properties: { type: { type: 'string', enum: IN_ANIMS }, delay: S.num('Start na s'), duration: S.num('Duur s') } }, out: { type: 'object', properties: { type: { type: 'string', enum: IN_ANIMS }, delay: S.num('Seconden vóór het einde'), duration: S.num('Duur s') } }, emphasis: { type: 'object', properties: { type: { type: 'string', enum: EMPH_ANIMS }, speed: S.num('Snelheid, 1 = normaal') } } }, required: ['design_id', 'element_id'] } },
-  { name: 'add_to_library', description: 'Zet een afbeelding alleen in de uploads (niet op het canvas), optioneel gedeeld met het team.', inputSchema: { type: 'object', properties: { image_url: S.str('URL of data-URL'), name: S.str('Bestandsnaam'), shared: S.bool('Delen met team') }, required: ['image_url'] } },
+  { name: 'add_to_library', description: 'Zet een afbeelding alleen in de uploads (niet op het canvas), optioneel gedeeld met het team.', inputSchema: { type: 'object', properties: { image_url: S.str('URL, data-URL of svg-code (begint met <svg). Svg wordt automatisch opgeschoond, krijgt een vaste maat en wordt gecontroleerd.'), name: S.str('Bestandsnaam'), shared: S.bool('Delen met team') }, required: ['image_url'] } },
   { name: 'list_brand_kits', description: 'Merksets van klanten (kleuren, lettertypes, logo-URL\'s) om in de huisstijl te ontwerpen.', inputSchema: { type: 'object', properties: {} } },
   { name: 'list_assets', description: 'Afbeeldingen in de uploads van de gebruiker en de gedeelde teamuploads.', inputSchema: { type: 'object', properties: { shared: S.bool('Alleen gedeelde teamuploads') } } },
   // ---- kijken en controleren
@@ -1499,6 +1553,12 @@ FOTO'S (de meest gemaakte fouten)
 - Gebruik een mask (circle, arch) alleen als het onderwerp er ruim in past.
 - Geen tekst over gezichten of het product. Tekst op een foto: zet een vlak of donker verloop eronder of kies een rustig deel van de foto.
 - Vergroot kleine foto's niet sterk op (wazig). Voorkom dat een foto als achtergrond de tekst onleesbaar maakt.
+
+SVG'S EN LOGO'S
+- Een svg (logo, illustratie, vorm) plaats je met add_image. Geef een url, een data-URL of de svg-code zelf (beginnend met <svg). Adwerk schoont hem op (xmlns, viewBox, vaste maat, geen scripts) en controleert of hij tekent; krijg je een foutmelding, herstel dan de code en probeer opnieuw.
+- Een enkel icoon (pijl, vinkje, ster) plaats je liever met add_icon: dat is scherp en de kleur is aan te passen.
+- Tekst in een svg wordt in het servervoorbeeld niet getoond (geen lettertypes). Zet tekst daarom met add_text en houd svg's vrij van <text>.
+- Gebruik geen svg met <foreignObject>, externe afbeeldingen of externe lettertypes: die tekenen niet. Plaats een svg nooit vervormd: laat breedte of hoogte leeg zodat de verhouding klopt.
 
 TEKST EN OPMAAK
 - Hiërarchie: één duidelijke kop (groot en vet), hooguit één ondersteunende regel, één call to action als knop. In banners nog korter.
