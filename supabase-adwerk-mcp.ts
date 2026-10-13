@@ -712,6 +712,11 @@ async function checkFrame(f: Frame): Promise<string[]> {
         if (!o.visible || o.type !== 'rect') continue
         const ob = box.get(o.id)!
         if (inside(c, ob) && ob.w * ob.h < f.w * f.h * 0.3 && (b.x < ob.x - 1 || b.x + b.w > ob.x + ob.w + 1 || b.y < ob.y - 1 || b.y + b.h > ob.y + ob.h + 1)) { out.push(`${label(e)} steekt buiten het vlak "${o.name}" (${o.id}) eronder`); break }
+        if (inside(c, ob) && ob.w * ob.h < f.w * f.h * 0.3) {
+          const dy = Math.abs((b.y + b.h / 2) - (ob.y + ob.h / 2)), dx = e.align === 'center' ? Math.abs((b.x + b.w / 2) - (ob.x + ob.w / 2)) : 0
+          if (dy > ob.h * 0.12 || dx > ob.w * 0.06) out.push(`${label(e)} staat niet in het midden van "${o.name}" (${o.id}); centreer de tekst in de knop (zelfde x en breedte, align center, y = knop.y + (knop.hoogte - teksthoogte) / 2)`)
+          break
+        }
       }
       for (let j = i + 1; j < f.elements.length; j++) {
         const o = f.elements[j]
