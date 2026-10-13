@@ -15,3 +15,14 @@ drop policy if exists "adwerk previews" on storage.objects;
 create policy "adwerk previews" on storage.objects for insert to authenticated with check (bucket_id = 'assets' and (storage.foldername(name))[1] = 'previews');
 drop policy if exists "adwerk previews update" on storage.objects;
 create policy "adwerk previews update" on storage.objects for update to authenticated using (bucket_id = 'assets' and (storage.foldername(name))[1] = 'previews');
+-- Live bijwerken in de hele app
+do $$ declare t text; begin
+  foreach t in array array['profiles','folders','brand_kits','assets','design_members'] loop
+    begin execute format('alter publication supabase_realtime add table public.%I', t); exception when duplicate_object then null; end;
+  end loop;
+end $$;
+alter table public.design_members replica identity full;
+alter table public.assets replica identity full;
+alter table public.folders replica identity full;
+alter table public.brand_kits replica identity full;
+alter table public.designs replica identity full;

@@ -730,6 +730,8 @@ async function checkFrame(f: Frame): Promise<string[]> {
       if (story && (b.y < f.h * 0.14 || b.y + b.h > f.h * 0.8) && b.w < f.w * 0.5) out.push(`${label(e)} staat in de veilige zone van de story`)
     }
   })
+  const area = f.elements.filter((e) => e.visible && e.type === 'text').reduce((sum, t) => { const bb = box.get(t.id)!; return sum + bb.w * bb.h }, 0) / (f.w * f.h)
+  if (area > 0.25) out.push(`tekst bedekt ongeveer ${Math.round(area * 100)}% van het beeld; minder tekst presteert meestal beter`)
   if (banner && words > 20) out.push(`${words} woorden in een banner van ${f.w}×${f.h}: te veel, houd het bij een korte kop, één voordeel en een knop`)
   if (!banner && words > 40) out.push(`${words} woorden: veel tekst voor een advertentie; kort in tot kop, ondersteuning en call to action`)
   if (f.platform === 'Google Display' && f.duration > 30) out.push(`animatie duurt ${f.duration}s; Google Ads staat maximaal 30s toe`)
@@ -1500,6 +1502,7 @@ FOTO'S (de meest gemaakte fouten)
 
 TEKST EN OPMAAK
 - Hiërarchie: één duidelijke kop (groot en vet), hooguit één ondersteunende regel, één call to action als knop. In banners nog korter.
+- Na elke wijziging krijg je de advertentiecontrole terug (dezelfde als in de editor). Ga door tot die overal groen is.
 - Leesbaar op mobiel: kop op 1080px minimaal ~60px, bodytekst minimaal ~30px; in kleine banners minimaal 11 tot 12px.
 - Contrast minimaal 4,5:1 (grote koppen 3:1). Wit op Spot Oranje (#EA5F39) is te zwak; gebruik #CC4A25 of donkere tekst.
 - Marge: houd ongeveer 5% van de korte zijde vrij aan alle randen. Lijn elementen op elkaar uit (align_elements), gelijke tussenruimtes (distribute_elements).
@@ -1528,6 +1531,21 @@ async function rpc(msg: { jsonrpc: string; id?: string | number; method: string;
         try {
           const name = String(params?.name), args = (params?.arguments || {}) as Json
           const out = await call(name, args, ctx) as { content: Json[] }
+          // advertentiecontrole: alles wat in de editor niet groen is, krijgt de agent direct terug
+          if (args.preview !== true && PREVIEWABLE.includes(name) && args.design_id) {
+            try {
+              const row = await loadDesign(String(args.design_id), ctx)
+              let frames = row.data.frames
+              const txt = String((out.content[0] as { text?: string }).text || '')
+              const ids = new Set([...txt.matchAll(/"frame_id":\s*"([^"]+)"/g)].map((m) => m[1]))
+              if (args.frame_id && args.frame_id !== 'all') ids.add(String(args.frame_id))
+              if (args.element_id) { try { ids.add(findEl(row.data, String(args.element_id)).frame.id) } catch { /* verwijderd */ } }
+              if (ids.size) frames = frames.filter((f) => ids.has(f.id))
+              const lines: string[] = []
+              for (const f of frames.slice(0, 8)) { const c = await checkFrame(f); if (c.length) lines.push(`${f.name} (${f.id}):\n- ${c.join('\n- ')}`) }
+              out.content.push({ type: 'text', text: lines.length ? `Advertentiecontrole, nog niet groen. Los dit op en controleer met get_preview:\n${lines.join('\n')}` : 'Advertentiecontrole: alles groen.' })
+            } catch { /* controle is een extraatje */ }
+          }
           if (args.preview === true && PREVIEWABLE.includes(name) && args.design_id) {
             let fid = args.frame_id as string | undefined
             if (!fid || fid === 'all') {
