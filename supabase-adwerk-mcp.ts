@@ -2,11 +2,319 @@
 // Transport: MCP Streamable HTTP (stateless, JSON-antwoorden). Toegang met een persoonlijke sleutel uit Adwerk.
 // Elke actie verschijnt live bij wie het ontwerp open heeft: een cursor die zich als een mens beweegt, daarna de wijziging.
 import { createClient } from 'npm:@supabase/supabase-js@2'
+import opentype from 'npm:opentype.js@1.3.4'
+import { initWasm, Resvg } from 'npm:@resvg/resvg-wasm@2.6.2'
 
 const SB_URL = Deno.env.get('SUPABASE_URL')!
 const SRK = Deno.env.get('SUPABASE_SERVICE_ROLE_KEY')!
 const APP_URL = 'https://serviceteam-daarom.github.io/adwerk/'
 const db = createClient(SB_URL, SRK, { auth: { persistSession: false } })
+
+// ===== SERVER-RENDER (begin) =====
+// Rendert een formaat naar PNG zonder browser: SVG opbouwen (tekst als paden via opentype.js) en rasteren met resvg.
+// Wordt gebruikt als niemand het ontwerp open heeft; anders levert de editor een pixel-exacte render.
+
+// deno-lint-ignore no-explicit-any
+type AnyEl = Record<string, any>
+// deno-lint-ignore no-explicit-any
+type AnyFrame = { w: number; h: number; duration: number; background: { type: string; color: string; color2: string; angle: number; src?: string }; elements: AnyEl[] }
+
+let wasm: Promise<void> | null = null
+const ensureWasm = () => (wasm ??= initWasm(fetch('https://unpkg.com/@resvg/resvg-wasm@2.6.2/index_bg.wasm')))
+
+/* ---------- fonts ---------- */
+const fontCache = new Map<string, Promise<opentype.Font | null>>()
+const WEIGHTS = [100, 200, 300, 400, 500, 600, 700, 800, 900]
+async function fetchFont(family: string, weight: number, italic: boolean): Promise<opentype.Font | null> {
+  const key = `${family}|${weight}|${italic}`
+  if (!fontCache.has(key)) {
+    fontCache.set(key, (async () => {
+      const slug = family.toLowerCase().trim().replace(/\s+/g, '-')
+      const r = await fetch(`https://cdn.jsdelivr.net/fontsource/fonts/${slug}@latest/latin-${weight}-${italic ? 'italic' : 'normal'}.woff`)
+      if (!r.ok) return null
+      return opentype.parse(await r.arrayBuffer())
+    })().catch(() => null))
+  }
+  return fontCache.get(key)!
+}
+async function loadFont(family: string, weight: number, italic: boolean): Promise<opentype.Font> {
+  const order = [...WEIGHTS].sort((a, b) => Math.abs(a - weight) - Math.abs(b - weight) || b - a)
+  for (const fam of [family, 'Poppins']) {
+    for (const it of italic ? [true, false] : [false]) {
+      for (const w of order.slice(0, 4)) { const f = await fetchFont(fam, w, it); if (f) return f }
+    }
+  }
+  throw new Error('Lettertype niet beschikbaar')
+}
+
+/* ---------- beelden ---------- */
+const imgCache = new Map<string, Promise<{ uri: string; w: number; h: number; svg: boolean } | null>>()
+function dims(bytes: Uint8Array, type: string) {
+  const dv = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength)
+  try {
+    if (bytes[0] === 0x89 && bytes[1] === 0x50) return { w: dv.getUint32(16), h: dv.getUint32(20) }
+    if (bytes[0] === 0x47 && bytes[1] === 0x49) return { w: dv.getUint16(6, true), h: dv.getUint16(8, true) }
+    if (bytes[0] === 0xff && bytes[1] === 0xd8) {
+      let i = 2
+      while (i < bytes.length) {
+        if (bytes[i] !== 0xff) { i++; continue }
+        const m = bytes[i + 1], len = dv.getUint16(i + 2)
+        if (m >= 0xc0 && m <= 0xcf && ![0xc4, 0xc8, 0xcc].includes(m)) return { h: dv.getUint16(i + 5), w: dv.getUint16(i + 7) }
+        i += 2 + len
+      }
+    }
+    if (String.fromCharCode(...bytes.slice(8, 12)) === 'WEBP') {
+      const c = String.fromCharCode(...bytes.slice(12, 16))
+      if (c === 'VP8X') return { w: 1 + (bytes[24] | (bytes[25] << 8) | (bytes[26] << 16)), h: 1 + (bytes[27] | (bytes[28] << 8) | (bytes[29] << 16)) }
+      if (c === 'VP8L') { const b = dv.getUint32(21, true); return { w: (b & 0x3fff) + 1, h: ((b >> 14) & 0x3fff) + 1 } }
+      if (c === 'VP8 ') return { w: dv.getUint16(26, true) & 0x3fff, h: dv.getUint16(28, true) & 0x3fff }
+    }
+    if (type.includes('svg')) {
+      const t = new TextDecoder().decode(bytes.slice(0, 4000))
+      const vb = t.match(/viewBox="\s*[-\d.]+[\s,]+[-\d.]+[\s,]+([\d.]+)[\s,]+([\d.]+)/)
+      if (vb) return { w: +vb[1], h: +vb[2] }
+    }
+  } catch { /* onbekend */ }
+  return { w: 1000, h: 1000 }
+}
+const b64 = (bytes: Uint8Array) => { let s = ''; for (let i = 0; i < bytes.length; i += 0x8000) s += String.fromCharCode(...bytes.subarray(i, i + 0x8000)); return btoa(s) }
+function loadImg(src: string) {
+  if (!imgCache.has(src)) {
+    imgCache.set(src, (async () => {
+      let bytes: Uint8Array, type: string
+      if (src.startsWith('data:')) {
+        const m = src.match(/^data:([^;,]+)(;base64)?,(.*)$/s)
+        if (!m) return null
+        type = m[1]
+        bytes = m[2] ? Uint8Array.from(atob(m[3]), (c) => c.charCodeAt(0)) : new TextEncoder().encode(decodeURIComponent(m[3]))
+      } else {
+        const r = await fetch(src)
+        if (!r.ok) return null
+        type = (r.headers.get('content-type') || '').split(';')[0] || (src.endsWith('.svg') ? 'image/svg+xml' : 'image/png')
+        bytes = new Uint8Array(await r.arrayBuffer())
+      }
+      if (/\.svg(\?|$)/i.test(src)) type = 'image/svg+xml'
+      const d = dims(bytes, type)
+      return { uri: `data:${type};base64,${b64(bytes)}`, w: d.w, h: d.h, svg: type.includes('svg') }
+    })().catch(() => null))
+  }
+  return imgCache.get(src)!
+}
+
+async function iconifySvg(name: string): Promise<string | null> {
+  try {
+    const r = await fetch(`https://api.iconify.design/lucide/${name}.svg?height=256`)
+    return r.ok ? await r.text() : null
+  } catch { return null }
+}
+
+/* ---------- animatie (zelfde als de editor) ---------- */
+interface St { dx: number; dy: number; scale: number; rotation: number; opacity: number }
+const clamp01 = (v: number) => Math.max(0, Math.min(1, v))
+const eoc = (t: number) => 1 - Math.pow(1 - t, 3)
+const eob = (t: number) => { const c1 = 1.70158, c3 = c1 + 1; return 1 + c3 * Math.pow(t - 1, 3) + c1 * Math.pow(t - 1, 2) }
+function inState(type: string, p: number, dist: number): St {
+  const e = eoc(p), s: St = { dx: 0, dy: 0, scale: 1, rotation: 0, opacity: 1 }
+  switch (type) {
+    case 'fade': s.opacity = e; break
+    case 'slideUp': s.dy = (1 - e) * dist; s.opacity = e; break
+    case 'slideDown': s.dy = -(1 - e) * dist; s.opacity = e; break
+    case 'slideLeft': s.dx = (1 - e) * dist; s.opacity = e; break
+    case 'slideRight': s.dx = -(1 - e) * dist; s.opacity = e; break
+    case 'zoomIn': s.scale = 0.6 + 0.4 * e; s.opacity = e; break
+    case 'zoomOut': s.scale = 1.4 - 0.4 * e; s.opacity = e; break
+    case 'pop': s.scale = Math.max(0, eob(p)); s.opacity = clamp01(p * 3); break
+    case 'spin': s.rotation = -120 * (1 - e); s.scale = 0.3 + 0.7 * e; s.opacity = e; break
+  }
+  return s
+}
+function emph(type: string, t: number, speed: number): St {
+  const s: St = { dx: 0, dy: 0, scale: 1, rotation: 0, opacity: 1 }, ph = (t * speed * Math.PI * 2) / 1.6
+  if (type === 'pulse') s.scale = 1 + 0.06 * (0.5 - 0.5 * Math.cos(ph))
+  if (type === 'wiggle') s.rotation = 4 * Math.sin(ph * 2)
+  if (type === 'float') s.dy = -8 * (0.5 - 0.5 * Math.cos(ph))
+  if (type === 'blink') s.opacity = 0.35 + 0.65 * (0.5 + 0.5 * Math.cos(ph))
+  return s
+}
+function stateAt(el: AnyEl, f: AnyFrame, t: number): St {
+  const a = el.anim, st: St = { dx: 0, dy: 0, scale: 1, rotation: 0, opacity: 1 }
+  if (!a) return st
+  const dist = Math.round(Math.min(f.w, f.h) * 0.18), parts: St[] = []
+  let inEnd = 0
+  if (a.in?.type !== 'none') { parts.push(inState(a.in.type, clamp01((t - a.in.delay) / Math.max(0.01, a.in.duration)), dist)); inEnd = a.in.delay + a.in.duration }
+  if (a.emph?.type !== 'none' && t > inEnd) parts.push(emph(a.emph.type, t - inEnd, a.emph.speed || 1))
+  if (a.out?.type !== 'none') { const start = f.duration - a.out.duration - a.out.delay, q = clamp01((t - start) / Math.max(0.01, a.out.duration)); if (q > 0) parts.push(inState(a.out.type, 1 - q, dist)) }
+  for (const p of parts) { st.dx += p.dx; st.dy += p.dy; st.scale *= p.scale; st.rotation += p.rotation; st.opacity *= p.opacity }
+  return st
+}
+
+/* ---------- tekst ---------- */
+const esc = (s: string) => s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/"/g, '&quot;')
+function advance(font: opentype.Font, s: string, fs: number, ls: number) {
+  const glyphs = font.stringToGlyphs(s), k = fs / font.unitsPerEm
+  let w = 0
+  glyphs.forEach((g: opentype.Glyph, i: number) => { w += (g.advanceWidth || 0) * k + ls; if (i < glyphs.length - 1) w += font.getKerningValue(g, glyphs[i + 1]) * k })
+  return w
+}
+function pathFor(font: opentype.Font, s: string, x: number, y: number, fs: number, ls: number) {
+  const glyphs = font.stringToGlyphs(s), k = fs / font.unitsPerEm
+  let d = '', cx = x
+  glyphs.forEach((g: opentype.Glyph, i: number) => { d += g.getPath(cx, y, fs).toPathData(2); cx += (g.advanceWidth || 0) * k + ls; if (i < glyphs.length - 1) cx += font.getKerningValue(g, glyphs[i + 1]) * k })
+  return d
+}
+/** Zelfde opmaak als het canvas: woordafbreking, regelafstand, uitlijning, en kleiner als één woord niet past. */
+async function layoutText(el: AnyEl) {
+  const font = await loadFont(el.fontFamily || 'Poppins', el.fontWeight || 400, !!el.italic)
+  const text = String(el.uppercase ? (el.text || '').toUpperCase() : el.text || '')
+  const ls = el.letterSpacing || 0, w = el.width
+  let fs = el.fontSize || 24
+  const words = text.split(/\s+/).filter(Boolean)
+  if (words.length) { const widest = Math.max(...words.map((x) => advance(font, x, fs, ls))); if (widest > w && w > 0) fs = Math.max(4, fs * (w / widest) * 0.98) }
+  const lines: string[] = []
+  for (const para of text.split('\n')) {
+    let line = ''
+    for (const word of para.split(' ')) {
+      const test = line ? line + ' ' + word : word
+      if (line && advance(font, test, fs, ls) > w) { lines.push(line); line = word } else line = test
+    }
+    lines.push(line)
+  }
+  const lh = fs * (el.lineHeight || 1.2)
+  const mid = ((font.ascender + font.descender) / 2) * (fs / font.unitsPerEm)
+  let d = '', under = ''
+  lines.forEach((ln, i) => {
+    const lw = advance(font, ln, fs, ls) - (ln ? ls : 0)
+    const x = el.align === 'center' ? (w - lw) / 2 : el.align === 'right' ? w - lw : 0
+    const base = lh * i + lh / 2 + mid
+    d += pathFor(font, ln, x, base, fs, ls)
+    if (el.underline && ln) under += `<rect x="${x.toFixed(1)}" y="${(base + fs * 0.12).toFixed(1)}" width="${lw.toFixed(1)}" height="${(fs * 0.06).toFixed(1)}"/>`
+  })
+  return { d, under, height: Math.ceil(lines.length * lh), fontSize: fs, lines }
+}
+
+/* ---------- formaat naar SVG ---------- */
+function star(w: number, h: number, n: number, ratio: number) {
+  const p: string[] = []
+  for (let i = 0; i < n * 2; i++) { const r = i % 2 === 0 ? 1 : ratio, a = (Math.PI * i) / n - Math.PI / 2; p.push(`${(w / 2 + Math.cos(a) * (w / 2) * r).toFixed(2)},${(h / 2 + Math.sin(a) * (h / 2) * r).toFixed(2)}`) }
+  return p.join(' ')
+}
+function cover(iw: number, ih: number, w: number, h: number, zoom = 1, fx = 0.5, fy = 0.5) {
+  const s = Math.max(w / iw, h / ih) * Math.max(1, zoom), cw = w / s, ch = h / s
+  return { x: (iw - cw) * clamp01(fx), y: (ih - ch) * clamp01(fy), w: cw, h: ch }
+}
+
+async function frameSvg(f: AnyFrame, t: number | null = null) {
+  let defs = '', body = '', uid = 0
+  const id = () => `x${uid++}`
+  const b = f.background
+  if (b.type === 'gradient') {
+    const a = ((b.angle || 0) * Math.PI) / 180, cx = f.w / 2, cy = f.h / 2, r = Math.abs((f.w / 2) * Math.cos(a)) + Math.abs((f.h / 2) * Math.sin(a))
+    defs += `<linearGradient id="bg" gradientUnits="userSpaceOnUse" x1="${cx - Math.cos(a) * r}" y1="${cy - Math.sin(a) * r}" x2="${cx + Math.cos(a) * r}" y2="${cy + Math.sin(a) * r}"><stop offset="0" stop-color="${b.color}"/><stop offset="1" stop-color="${b.color2}"/></linearGradient>`
+    body += `<rect width="${f.w}" height="${f.h}" fill="url(#bg)"/>`
+  } else body += `<rect width="${f.w}" height="${f.h}" fill="${b.color || '#FFFFFF'}"/>`
+  if (b.type === 'image' && b.src) {
+    const im = await loadImg(b.src)
+    if (im) { const c = cover(im.w, im.h, f.w, f.h); body += `<svg width="${f.w}" height="${f.h}" viewBox="${c.x} ${c.y} ${c.w} ${c.h}" preserveAspectRatio="none"><image width="${im.w}" height="${im.h}" href="${im.uri}"/></svg>` }
+  }
+
+  for (const el of f.elements) {
+    if (el.visible === false) continue
+    const w = el.width, st = t === null ? null : stateAt(el, f, t)
+    let inner = '', h = el.height
+    const fill = el.fill || '#000', stroke = el.strokeWidth > 0 ? ` stroke="${el.stroke}" stroke-width="${el.strokeWidth}"` : ''
+    switch (el.type) {
+      case 'text': {
+        const L = await layoutText(el)
+        h = L.height
+        inner = `<path d="${L.d}" fill="${fill}"${stroke}/>${L.under ? `<g fill="${fill}">${L.under}</g>` : ''}`
+        break
+      }
+      case 'ellipse': inner = `<ellipse cx="${w / 2}" cy="${h / 2}" rx="${w / 2}" ry="${h / 2}" fill="${fill}"${stroke}/>`; break
+      case 'triangle': inner = `<polygon points="${w / 2},0 ${w},${h} 0,${h}" fill="${fill}"${stroke} stroke-linejoin="round"/>`; break
+      case 'star': inner = `<polygon points="${star(w, h, el.points || 5, el.innerRatio || 0.45)}" fill="${fill}"${stroke} stroke-linejoin="round"/>`; break
+      case 'image': {
+        const m = el.mask || 'none', cid = id()
+        const rr = Math.min(el.cornerRadius || 0, w / 2, h / 2)
+        let clip = `<rect width="${w}" height="${h}" rx="${rr}"/>`
+        if (m === 'circle') clip = `<circle cx="${w / 2}" cy="${h / 2}" r="${Math.min(w, h) / 2}"/>`
+        if (m === 'oval') clip = `<ellipse cx="${w / 2}" cy="${h / 2}" rx="${w / 2}" ry="${h / 2}"/>`
+        if (m === 'arch') { const r = Math.min(w / 2, h); clip = `<path d="M0 ${h} L0 ${r} A${w / 2} ${r} 0 0 1 ${w} ${r} L${w} ${h} Z"/>` }
+        if (m === 'leaf') { const r = Math.min(w, h) * 0.45; clip = `<path d="M${r} 0 H${w} V${h - r} A${r} ${r} 0 0 1 ${w - r} ${h} H0 V${r} A${r} ${r} 0 0 1 ${r} 0 Z"/>` }
+        if (m === 'blob') clip = `<ellipse cx="${w * 0.66}" cy="${h * 0.66}" rx="${w * 0.8}" ry="${h * 0.8}"/>`
+        defs += `<clipPath id="${cid}">${clip}</clipPath>`
+        const im = el.src ? await loadImg(el.src) : null
+        if (im) {
+          const c = cover(im.w, im.h, w, h, el.cropZoom, el.cropX ?? 0.5, el.cropY ?? 0.5)
+          const flip = el.flipX || el.flipY ? ` transform="translate(${el.flipX ? w : 0} ${el.flipY ? h : 0}) scale(${el.flipX ? -1 : 1} ${el.flipY ? -1 : 1})"` : ''
+          inner = `<g clip-path="url(#${cid})"><g${flip}><svg width="${w}" height="${h}" viewBox="${c.x} ${c.y} ${c.w} ${c.h}" preserveAspectRatio="none"><image width="${im.w}" height="${im.h}" href="${im.uri}"/></svg></g></g>`
+        } else {
+          const s = Math.max(16, Math.min(w, h) * 0.16)
+          inner = `<g clip-path="url(#${cid})"><rect width="${w}" height="${h}" fill="${el.fill || '#D9D6E3'}"/></g><g transform="translate(${w / 2 - s / 2} ${h / 2 - s / 2}) scale(${s / 24})" fill="none" stroke="#fff" stroke-opacity=".75" stroke-width="1.6" stroke-linecap="round"><path d="M21 15l-5-5L5 21 M3 5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/><circle cx="9" cy="9" r="2"/></g>`
+        }
+        break
+      }
+      case 'icon': {
+        let svg: string | null = el.iconSvg || null
+        if (!svg && el.icon) svg = await iconifySvg(el.icon)
+        if (svg) {
+          if (!el.iconMulti) svg = svg.replace(/currentColor/g, fill)
+          inner = `<image width="${w}" height="${h}" href="data:image/svg+xml;base64,${b64(new TextEncoder().encode(svg))}"/>`
+        }
+        break
+      }
+      default: inner = `<rect width="${w}" height="${h}" rx="${Math.min(el.cornerRadius || 0, w / 2, h / 2)}" fill="${fill}"${stroke}/>`
+    }
+    const cx = el.x + w / 2 + (st?.dx || 0), cy = el.y + h / 2 + (st?.dy || 0)
+    const rot = (el.rotation || 0) + (st?.rotation || 0), sc = st?.scale ?? 1, op = (el.opacity ?? 1) * (st?.opacity ?? 1)
+    let filter = ''
+    if (el.shadow?.enabled) {
+      const fid = id(), s = el.shadow
+      defs += `<filter id="${fid}" x="-50%" y="-50%" width="200%" height="200%"><feDropShadow dx="${s.x}" dy="${s.y}" stdDeviation="${s.blur / 2}" flood-color="${s.color}" flood-opacity="${s.opacity}"/></filter>`
+      filter = ` filter="url(#${fid})"`
+    }
+    if (op <= 0.001) continue
+    body += `<g transform="translate(${cx.toFixed(2)} ${cy.toFixed(2)}) rotate(${rot}) scale(${sc}) translate(${(-w / 2).toFixed(2)} ${(-h / 2).toFixed(2)})" opacity="${op}"${filter}>${inner}</g>`
+  }
+  return `<svg xmlns="http://www.w3.org/2000/svg" width="${f.w}" height="${f.h}" viewBox="0 0 ${f.w} ${f.h}"><defs><clipPath id="frame"><rect width="${f.w}" height="${f.h}"/></clipPath>${defs}</defs><g clip-path="url(#frame)">${body}</g></svg>`
+}
+
+async function renderFramePng(f: AnyFrame, t: number | null, maxSide: number): Promise<Uint8Array> {
+  await ensureWasm()
+  const svg = await frameSvg(f, t)
+  const scale = Math.min(2, maxSide / Math.max(f.w, f.h))
+  const r = new Resvg(svg, { fitTo: { mode: 'zoom', value: scale }, font: { loadSystemFonts: false }, imageRendering: 0 })
+  const png = r.render().asPng()
+  r.free()
+  return png
+}
+void esc
+/** Toont een volledige (niet uitgesneden) foto met een raster van 10%, zodat de agent het focuspunt kan bepalen. */
+async function renderImageGrid(src: string, maxSide: number): Promise<{ png: Uint8Array; w: number; h: number }> {
+  await ensureWasm()
+  const im = await loadImg(src)
+  if (!im) throw new Error('Afbeelding kon niet worden geladen')
+  const W = im.w, H = im.h, sw = Math.max(1, Math.min(W, H) / 400), fs = Math.max(10, Math.min(W, H) / 32)
+  let grid = ''
+  for (let i = 1; i < 10; i++) {
+    const x = (W * i) / 10, y = (H * i) / 10, strong = i === 5
+    grid += `<line x1="${x}" y1="0" x2="${x}" y2="${H}" stroke="${strong ? '#FF2E88' : '#FFFFFF'}" stroke-opacity="${strong ? 0.9 : 0.55}" stroke-width="${sw}"/><line x1="0" y1="${y}" x2="${W}" y2="${y}" stroke="${strong ? '#FF2E88' : '#FFFFFF'}" stroke-opacity="${strong ? 0.9 : 0.55}" stroke-width="${sw}"/>`
+  }
+  const font = await loadFont('Poppins', 600, false)
+  let labels = ''
+  for (let i = 1; i < 10; i++) {
+    const v = (i / 10).toFixed(1)
+    labels += `<path d="${pathFor(font, v, (W * i) / 10 + fs * 0.2, fs * 1.1, fs, 0)}"/><path d="${pathFor(font, v, fs * 0.3, (H * i) / 10 - fs * 0.25, fs, 0)}"/>`
+  }
+  const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="${W}" height="${H}" viewBox="0 0 ${W} ${H}"><image width="${W}" height="${H}" href="${im.uri}"/>${grid}<g fill="#FFFFFF" stroke="#000" stroke-opacity=".6" stroke-width="${sw * 2}" paint-order="stroke">${labels}</g></svg>`
+  const r = new Resvg(svg, { fitTo: { mode: 'zoom', value: Math.min(1, maxSide / Math.max(W, H)) }, font: { loadSystemFonts: false } })
+  const png = r.render().asPng()
+  r.free()
+  return { png, w: W, h: H }
+}
+async function imageDims(src: string) { const im = await loadImg(src); return im ? { w: im.w, h: im.h } : null }
+
+// ===== SERVER-RENDER (einde) =====
+
 
 const CORS = {
   'Access-Control-Allow-Origin': '*',
@@ -303,6 +611,172 @@ function summarize(doc: Doc) {
 const ok = (v: unknown) => ({ content: [{ type: 'text', text: typeof v === 'string' ? v : JSON.stringify(v, null, 1) }] })
 const designUrl = (id: string) => `${APP_URL}#/d/${id}`
 
+/* ------------------------------------------------------------------ slim meeschalen (zelfde als de editor) */
+function smartResize(src: Frame, target: { w: number; h: number }): El[] {
+  const sx = target.w / src.w, sy = target.h / src.h, s = Math.min(sx, sy), sMax = Math.max(sx, sy)
+  const textK = () => Math.min(Math.max(s, Math.sqrt(sx * sy) * 0.85), sMax)
+  const story = target.h / target.w > 1.7 && !(src.h / src.w > 1.7)
+  const mapY = (cy: number) => (story ? target.h * 0.14 + (cy / src.h) * target.h * 0.66 : cy * sy)
+  const pairK = new Map<string, { k: number; cx: number; cy: number }>()
+  for (const e of src.elements) {
+    if (e.type === 'text' || e.width * e.height > src.w * src.h * 0.3) continue
+    const t = src.elements.find((t) => t.type === 'text' && t.x + t.width / 2 > e.x && t.x + t.width / 2 < e.x + e.width && t.y + t.height / 2 > e.y && t.y + t.height / 2 < e.y + e.height && t.width <= e.width * 1.2)
+    if (t) pairK.set(e.id, { k: textK(), cx: t.x + t.width / 2, cy: t.y + t.height / 2 })
+  }
+  return src.elements.map((e) => {
+    const n: El = clone(e)
+    n.id = uid()
+    if (e.width >= src.w * 0.9 && e.height >= src.h * 0.9) {
+      const k = e.type === 'image' ? sMax : 1
+      n.width = e.type === 'image' ? e.width * k : e.width * sx
+      n.height = e.type === 'image' ? e.height * k : e.height * sy
+      n.x = (target.w - n.width) / 2; n.y = (target.h - n.height) / 2
+      return n
+    }
+    const pair = pairK.get(e.id), ocx = e.x + e.width / 2, ocy = e.y + e.height / 2
+    const cx = pair ? pair.cx * sx + (ocx - pair.cx) * pair.k : ocx * sx
+    const cy = pair ? mapY(pair.cy) + (ocy - pair.cy) * pair.k : mapY(ocy)
+    let k = s
+    if (e.type === 'text') k = textK()
+    if (pair) k = pair.k
+    n.width = e.width * k; n.height = e.height * k
+    if (e.type === 'text') { n.fontSize = Math.max(8, Math.round((Number(e.fontSize) || 24) * k)); n.width = Math.min(n.width, target.w * 0.94) }
+    n.strokeWidth = e.strokeWidth * s; n.cornerRadius = e.cornerRadius * s
+    const sh = e.shadow as { blur: number; x: number; y: number }
+    n.shadow = { ...e.shadow, blur: (sh.blur || 0) * s, x: (sh.x || 0) * s, y: (sh.y || 0) * s }
+    n.x = cx - n.width / 2; n.y = cy - n.height / 2
+    n.x = Math.min(Math.max(n.x, -n.width * 0.4), target.w - n.width * 0.6)
+    n.y = Math.min(Math.max(n.y, -n.height * 0.4), target.h - n.height * 0.6)
+    return n
+  })
+}
+
+/* ------------------------------------------------------------------ controle: veelgemaakte fouten */
+function lum(hex: string) {
+  const m = hex.replace('#', '').match(/^([0-9a-f]{6}|[0-9a-f]{3})/i)
+  if (!m) return 0.5
+  const h = m[1].length === 3 ? m[1].split('').map((c) => c + c).join('') : m[1]
+  const c = [0, 2, 4].map((i) => parseInt(h.slice(i, i + 2), 16) / 255).map((x) => (x <= 0.03928 ? x / 12.92 : ((x + 0.055) / 1.055) ** 2.4))
+  return 0.2126 * c[0] + 0.7152 * c[1] + 0.0722 * c[2]
+}
+const contrast = (a: string, b: string) => { const x = lum(a), y = lum(b); return (Math.max(x, y) + 0.05) / (Math.min(x, y) + 0.05) }
+
+async function checkFrame(f: Frame): Promise<string[]> {
+  const out: string[] = []
+  const minSide = Math.min(f.w, f.h), story = f.h / f.w > 1.7, banner = minSide <= 320
+  const box = new Map<string, { x: number; y: number; w: number; h: number }>()
+  for (const e of f.elements) {
+    let h = e.height
+    if (e.type === 'text') { try { h = (await layoutText(e)).height } catch { /* schatting */ } }
+    box.set(e.id, { x: e.x, y: e.y, w: e.width, h })
+  }
+  const label = (e: El) => `${e.type === 'text' ? `tekst "${String(e.text || '').replace(/\n/g, ' ').slice(0, 28)}"` : `${e.type} "${e.name}"`} (${e.id})`
+  const inside = (p: { x: number; y: number }, b: { x: number; y: number; w: number; h: number }) => p.x >= b.x && p.x <= b.x + b.w && p.y >= b.y && p.y <= b.y + b.h
+  const overlap = (a: { x: number; y: number; w: number; h: number }, b: { x: number; y: number; w: number; h: number }) => Math.max(0, Math.min(a.x + a.w, b.x + b.w) - Math.max(a.x, b.x)) * Math.max(0, Math.min(a.y + a.h, b.y + b.h) - Math.max(a.y, b.y))
+  let words = 0
+  f.elements.forEach((e, i) => {
+    if (!e.visible) return
+    const b = box.get(e.id)!
+    const outPart = (Math.max(0, -b.x) + Math.max(0, b.x + b.w - f.w)) / Math.max(1, b.w) + (Math.max(0, -b.y) + Math.max(0, b.y + b.h - f.h)) / Math.max(1, b.h)
+    if (e.type === 'text') {
+      words += String(e.text || '').split(/\s+/).filter(Boolean).length
+      if (!String(e.text || '').trim()) out.push(`${label(e)} is leeg`)
+      if (outPart > 0.01) out.push(`${label(e)} valt (deels) buiten het formaat`)
+      const fs = Number(e.fontSize) || 24
+      const minFs = banner ? 11 : Math.round(minSide * 0.028)
+      if (fs < minFs) out.push(`${label(e)} is ${fs}px: te klein om op mobiel te lezen, minimaal ongeveer ${minFs}px`)
+      const m = minSide * 0.04
+      if (outPart <= 0.01 && (b.x < m || b.y < m || b.x + b.w > f.w - m || b.y + b.h > f.h - m)) out.push(`${label(e)} staat te dicht op de rand; houd minstens ${Math.round(m)}px marge`)
+      if (story && (b.y < f.h * 0.14 || b.y + b.h > f.h * 0.8)) out.push(`${label(e)} staat in de veilige zone van de story (boven 14% of onder 20%); daar vallen profielnaam en knoppen overheen`)
+      // contrast met wat eronder ligt
+      const c = { x: b.x + b.w / 2, y: b.y + b.h / 2 }
+      let under: string[] | null = null, onPhoto = false
+      for (let j = i - 1; j >= 0; j--) {
+        const o = f.elements[j]
+        if (!o.visible || o.type === 'text' || o.type === 'icon' || o.type === 'line') continue
+        if (!inside(c, box.get(o.id)!)) continue
+        if (o.type === 'image') { onPhoto = !!o.src; under = o.src ? null : [o.fill]; break }
+        if ((o.opacity ?? 1) > 0.6) { under = [o.fill]; break }
+      }
+      if (!under && !onPhoto) under = f.background.type === 'gradient' ? [f.background.color, f.background.color2] : f.background.type === 'image' ? null : [f.background.color]
+      if (f.background.type === 'image' && !under) onPhoto = true
+      if (onPhoto) out.push(`${label(e)} staat op een foto: controleer in de preview de leesbaarheid en of er geen gezicht of product achter de tekst valt; gebruik zo nodig een vlak of verloop eronder`)
+      else if (under) {
+        const large = fs >= minSide * 0.05 || (Number(e.fontWeight) >= 700 && fs >= minSide * 0.035)
+        const worst = Math.min(...under.map((u) => contrast(String(e.fill), u)))
+        if (worst < (large ? 3 : 4.5)) out.push(`${label(e)} heeft te weinig contrast (${worst.toFixed(1)}:1 met ${under.join(' / ')}); minimaal ${large ? '3' : '4,5'}:1`)
+      }
+      // tekst die buiten zijn knop of vlak steekt
+      for (let j = i - 1; j >= 0; j--) {
+        const o = f.elements[j]
+        if (!o.visible || o.type !== 'rect') continue
+        const ob = box.get(o.id)!
+        if (inside(c, ob) && ob.w * ob.h < f.w * f.h * 0.3 && (b.x < ob.x - 1 || b.x + b.w > ob.x + ob.w + 1 || b.y < ob.y - 1 || b.y + b.h > ob.y + ob.h + 1)) { out.push(`${label(e)} steekt buiten het vlak "${o.name}" (${o.id}) eronder`); break }
+      }
+      for (let j = i + 1; j < f.elements.length; j++) {
+        const o = f.elements[j]
+        if (o.visible && o.type === 'text' && overlap(b, box.get(o.id)!) > 4) out.push(`${label(e)} overlapt met ${label(o)}`)
+      }
+    } else if (e.type === 'image') {
+      if (!e.src) out.push(`${label(e)} is een leeg fotokader`)
+      if (outPart > 0.35) out.push(`${label(e)} valt grotendeels buiten het formaat`)
+    } else if (e.type === 'icon') {
+      if (outPart > 0.01) out.push(`${label(e)} valt (deels) buiten het formaat`)
+      if (story && (b.y < f.h * 0.14 || b.y + b.h > f.h * 0.8) && b.w < f.w * 0.5) out.push(`${label(e)} staat in de veilige zone van de story`)
+    }
+  })
+  if (banner && words > 20) out.push(`${words} woorden in een banner van ${f.w}×${f.h}: te veel, houd het bij een korte kop, één voordeel en een knop`)
+  if (!banner && words > 40) out.push(`${words} woorden: veel tekst voor een advertentie; kort in tot kop, ondersteuning en call to action`)
+  if (f.platform === 'Google Display' && f.duration > 30) out.push(`animatie duurt ${f.duration}s; Google Ads staat maximaal 30s toe`)
+  if (!f.elements.some((e) => e.type === 'text')) out.push('er staat geen tekst in dit formaat')
+  return out
+}
+
+/* ------------------------------------------------------------------ live beelden */
+/** Vraagt een open editor om een pixel-exacte render; anders null. */
+async function clientRender(designId: string, frameIds: string[], t: number | null, maxSide: number): Promise<Map<string, { bytes: Uint8Array; mime: string }> | null> {
+  const reqId = crypto.randomUUID()
+  await broadcast(designId, [{ event: 'render-request', payload: { reqId, frameIds, time: t, maxSide } }])
+  const start = Date.now()
+  let files: { name: string }[] = [], acked = false
+  while (Date.now() - start < 12000) {
+    await sleep(300)
+    const { data } = await db.storage.from('assets').list(`previews/${reqId}`)
+    const all = (data || []) as { name: string }[]
+    acked = all.some((f) => f.name === '_ack')
+    files = all.filter((f) => f.name !== '_ack')
+    if (files.length >= frameIds.length) break
+    if (!acked && Date.now() - start > 2500) break
+  }
+  const paths = [...files.map((f) => `previews/${reqId}/${f.name}`), `previews/${reqId}/_ack`]
+  if (!files.length) { if (acked) db.storage.from('assets').remove(paths).then(() => {}); return null }
+  const map = new Map<string, { bytes: Uint8Array; mime: string }>()
+  for (const f of files) {
+    const { data } = await db.storage.from('assets').download(`previews/${reqId}/${f.name}`)
+    if (data) map.set(f.name.replace(/\.\w+$/, ''), { bytes: new Uint8Array(await data.arrayBuffer()), mime: f.name.endsWith('.png') ? 'image/png' : 'image/jpeg' })
+  }
+  db.storage.from('assets').remove(paths).then(() => {})
+  return map
+}
+
+async function previewContent(designId: string, ctx: Ctx, opts: { frame_id?: string; time?: number | null; size?: number; checks?: boolean }) {
+  const row = await loadDesign(designId, ctx)
+  const frames = (opts.frame_id ? pickFrames(row.data, opts.frame_id) : row.data.frames).slice(0, 8)
+  const t = typeof opts.time === 'number' ? opts.time : null
+  const size = Math.max(200, Math.min(1400, opts.size || 900))
+  const live = await clientRender(designId, frames.map((f) => f.id), t, size)
+  const content: Json[] = []
+  for (const f of frames) {
+    let img = live?.get(f.id)
+    let src = 'pixel-exact uit de open editor'
+    if (!img) { img = { bytes: await renderFramePng(f, t, size), mime: 'image/png' }; src = 'serverrender (lettertypes en beelden benaderen de editor)' }
+    const checks = opts.checks === false ? [] : await checkFrame(f)
+    content.push({ type: 'text', text: `${f.name} · frame_id ${f.id} · ${f.w}×${f.h}px${t !== null ? ` · op ${t}s van de animatie` : ''} · ${src}\n${opts.checks === false ? '' : checks.length ? 'Controle, los dit op:\n- ' + checks.join('\n- ') : 'Controle: geen veelgemaakte fouten gevonden. Kijk zelf nog naar uitsnede, hiërarchie en balans.'}` })
+    content.push({ type: 'image', data: b64(img.bytes), mimeType: img.mime })
+  }
+  return content
+}
+
 /* ------------------------------------------------------------------ tools */
 const S = {
   str: (d: string) => ({ type: 'string', description: d }),
@@ -313,7 +787,8 @@ const DESIGN = S.str('Id van het ontwerp (uit list_designs of create_design)')
 const FRAME = S.str('Id van het formaat (uit get_design). Laat leeg voor het eerste formaat, of gebruik "all" om het in alle formaten te zetten; waarden gelden dan voor het eerste formaat en schalen mee.')
 const BOX = { x: S.num('Links in px vanaf de linkerrand van het formaat'), y: S.num('Boven in px vanaf de bovenrand'), width: S.num('Breedte in px'), height: S.num('Hoogte in px') }
 
-const TOOLS = [
+const PREVIEWABLE = ['set_background', 'add_text', 'add_shape', 'add_image', 'add_icon', 'update_element', 'delete_element', 'arrange_element', 'animate_element', 'add_many', 'update_many', 'duplicate_element', 'align_elements', 'distribute_elements', 'copy_to_all_formats', 'set_image_crop', 'fit_image', 'animation_preset', 'add_format']
+const TOOLS: { name: string; description: string; inputSchema: { type: string; properties: Json; required?: string[] } }[] = [
   { name: 'list_formats', description: 'Toont alle beschikbare advertentieformaten (key, naam, breedte, hoogte, platform) en de standaardsets.', inputSchema: { type: 'object', properties: {} } },
   { name: 'list_designs', description: 'Lijst van ontwerpen waar de gebruiker bij kan, nieuwste eerst.', inputSchema: { type: 'object', properties: { search: S.str('Zoekterm in de titel'), scope: { type: 'string', enum: ['mine', 'team', 'all'], description: 'mine = eigen ontwerpen, team = gedeeld, all = alles (standaard)' } } } },
   { name: 'get_design', description: 'Volledige inhoud van een ontwerp: formaten met id, afmetingen, achtergrond en alle elementen (id, type, positie, tekst, kleur, animatie). Gebruik dit voordat je iets aanpast. Laag 0 ligt achteraan.', inputSchema: { type: 'object', properties: { design_id: DESIGN }, required: ['design_id'] } },
@@ -323,7 +798,7 @@ const TOOLS = [
   { name: 'set_background', description: 'Achtergrond van een of alle formaten: effen kleur, kleurverloop of foto (URL wordt opgeslagen in Adwerk).', inputSchema: { type: 'object', properties: { design_id: DESIGN, frame_id: FRAME, type: { type: 'string', enum: ['solid', 'gradient', 'image'] }, color: S.str('Hex-kleur, bijv. #1B213B'), color2: S.str('Tweede kleur bij verloop'), angle: S.num('Hoek van het verloop in graden'), image_url: S.str('Foto-URL of data-URL bij type image') }, required: ['design_id'] } },
   { name: 'add_text', description: `Voegt een tekstblok toe. Lettertypes: ${FONTS.join(', ')} of een andere Google Font.`, inputSchema: { type: 'object', properties: { design_id: DESIGN, frame_id: FRAME, text: S.str('De tekst; \\n voor een nieuwe regel'), ...BOX, font_size: S.num('Lettergrootte in px'), font_family: S.str('Lettertype (standaard Poppins)'), font_weight: S.num('400, 500, 600, 700, 800 of 900'), color: S.str('Hex-kleur'), align: { type: 'string', enum: ['left', 'center', 'right'] }, line_height: S.num('Regelafstand, bijv. 1.15'), letter_spacing: S.num('Letterafstand in px'), uppercase: S.bool('Hoofdletters'), italic: S.bool('Cursief'), name: S.str('Laagnaam') }, required: ['design_id', 'text'] } },
   { name: 'add_shape', description: 'Voegt een vorm toe: rect, rounded, pill, ellipse, triangle, star, badge of line. Handig voor knoppen, vlakken en accenten.', inputSchema: { type: 'object', properties: { design_id: DESIGN, frame_id: FRAME, shape: { type: 'string', enum: ['rect', 'rounded', 'pill', 'ellipse', 'triangle', 'star', 'badge', 'line'] }, ...BOX, color: S.str('Vulkleur (hex)'), corner_radius: S.num('Afronding in px'), stroke_color: S.str('Randkleur'), stroke_width: S.num('Randdikte'), opacity: S.num('0 tot 1'), name: S.str('Laagnaam') }, required: ['design_id', 'shape'] } },
-  { name: 'add_image', description: 'Zet een afbeelding op het canvas vanaf een URL of data-URL. Het beeld wordt opgeslagen in de uploads van de gebruiker. Zonder breedte/hoogte past het beeld in de juiste verhouding. Met mask krijg je een vorm (circle, arch, oval, leaf, blob).', inputSchema: { type: 'object', properties: { design_id: DESIGN, frame_id: FRAME, image_url: S.str('URL of data-URL'), ...BOX, mask: { type: 'string', enum: ['none', 'circle', 'arch', 'oval', 'leaf', 'blob'] }, corner_radius: S.num('Afronding'), name: S.str('Laagnaam') }, required: ['design_id', 'image_url'] } },
+  { name: 'add_image', description: 'Bekijk de foto eerst met view_image. Zet een afbeelding op het canvas vanaf een URL of data-URL. Het beeld wordt opgeslagen in de uploads van de gebruiker. Zonder breedte/hoogte past het beeld in de juiste verhouding. Met mask krijg je een vorm (circle, arch, oval, leaf, blob).', inputSchema: { type: 'object', properties: { design_id: DESIGN, frame_id: FRAME, image_url: S.str('URL of data-URL'), ...BOX, mask: { type: 'string', enum: ['none', 'circle', 'arch', 'oval', 'leaf', 'blob'] }, corner_radius: S.num('Afronding'), focus_x: S.num('Focuspunt in de foto 0 tot 1 (uit view_image), bijv. tussen de ogen'), focus_y: S.num('Focuspunt 0 tot 1'), name: S.str('Laagnaam') }, required: ['design_id', 'image_url'] } },
   { name: 'add_icon', description: 'Zet een icoon uit 200.000+ open iconen (Iconify) op het canvas. Zoek eerst met search_icons.', inputSchema: { type: 'object', properties: { design_id: DESIGN, frame_id: FRAME, icon: S.str('Iconify-id, bijv. "ph:shopping-cart-bold"'), x: BOX.x, y: BOX.y, size: S.num('Grootte in px'), color: S.str('Kleur (hex) voor eenkleurige iconen') }, required: ['design_id', 'icon'] } },
   { name: 'search_icons', description: 'Zoekt open iconen (Engelse zoekwoorden werken het best). Geeft Iconify-id\'s terug voor add_icon.', inputSchema: { type: 'object', properties: { query: S.str('Zoekwoord, bijv. cart, phone, arrow'), pack: S.str('Optioneel pack-prefix, bijv. ph, tabler, lucide, mdi, logos'), limit: S.num('Max aantal (standaard 30)') }, required: ['query'] } },
   { name: 'update_element', description: 'Past een element aan. Geef alleen de eigenschappen die veranderen, bijvoorbeeld {"x":120,"text":"Nu 20% korting","fill":"#EA5F39","fontSize":64}. Mogelijk: x, y, width, height, rotation, opacity, visible, locked, fill, stroke, strokeWidth, cornerRadius, text, fontFamily, fontSize, fontWeight, italic, underline, align, lineHeight, letterSpacing, uppercase, src, mask, cropZoom, cropX, cropY, flipX, flipY, name, shadow {enabled,color,blur,x,y,opacity}.', inputSchema: { type: 'object', properties: { design_id: DESIGN, element_id: S.str('Id van het element'), props: { type: 'object', description: 'De te wijzigen eigenschappen' } }, required: ['design_id', 'element_id', 'props'] } },
@@ -333,6 +808,42 @@ const TOOLS = [
   { name: 'add_to_library', description: 'Zet een afbeelding alleen in de uploads (niet op het canvas), optioneel gedeeld met het team.', inputSchema: { type: 'object', properties: { image_url: S.str('URL of data-URL'), name: S.str('Bestandsnaam'), shared: S.bool('Delen met team') }, required: ['image_url'] } },
   { name: 'list_brand_kits', description: 'Merksets van klanten (kleuren, lettertypes, logo-URL\'s) om in de huisstijl te ontwerpen.', inputSchema: { type: 'object', properties: {} } },
   { name: 'list_assets', description: 'Afbeeldingen in de uploads van de gebruiker en de gedeelde teamuploads.', inputSchema: { type: 'object', properties: { shared: S.bool('Alleen gedeelde teamuploads') } } },
+  // ---- kijken en controleren
+  { name: 'get_preview', description: 'LIVE BEELD: geeft een afbeelding van één of alle formaten terug zoals ze er nu uitzien, plus een automatische controle op veelgemaakte fouten (contrast, te kleine tekst, buiten beeld, veilige zones, overlap, tekst op foto, te veel woorden). Heeft iemand het ontwerp open, dan is het beeld pixel-exact uit de editor. Gebruik dit na elke ontwerpstap en los alles op wat je ziet, tot het perfect is. Met time (seconden) zie je een moment uit de animatie.', inputSchema: { type: 'object', properties: { design_id: DESIGN, frame_id: S.str('Eén formaat; leeg = alle formaten (max 8)'), time: S.num('Moment in de animatie in seconden; leeg = eindbeeld'), size: S.num('Langste zijde van het beeld in px (200 tot 1400, standaard 900)'), checks: S.bool('Controle meesturen (standaard ja)') }, required: ['design_id'] } },
+  { name: 'check_design', description: 'Alleen de automatische controle op veelgemaakte fouten, zonder beeld. Snel na kleine aanpassingen.', inputSchema: { type: 'object', properties: { design_id: DESIGN, frame_id: S.str('Eén formaat; leeg = alle') }, required: ['design_id'] } },
+  { name: 'view_image', description: 'Toont een foto VOLLEDIG (niet uitgesneden) met een raster van 0,1 stappen, zodat je ziet waar gezichten, ogen, producten en lege ruimte zitten. Doe dit vóór je een foto plaatst of uitsnijdt en gebruik de coördinaten in set_image_crop. Geef een element_id of een url.', inputSchema: { type: 'object', properties: { design_id: DESIGN, element_id: S.str('Afbeeldingselement'), url: S.str('Of een losse afbeeldings-URL'), size: S.num('Langste zijde (standaard 900)') } } },
+  { name: 'set_image_crop', description: 'Bepaalt de uitsnede van een foto in zijn kader. focus_x en focus_y (0 tot 1, gemeten in de volledige foto via view_image) komen zo centraal mogelijk in beeld. Kies bij mensen het punt tussen de ogen of iets erboven, zodat hoofd en kin in beeld blijven. zoom 1 = zo ver mogelijk uitgezoomd, hoger = inzoomen.', inputSchema: { type: 'object', properties: { design_id: DESIGN, element_id: S.str('Afbeeldingselement'), focus_x: S.num('0 = links, 1 = rechts'), focus_y: S.num('0 = boven, 1 = onder'), zoom: S.num('1 of hoger'), flip_x: S.bool('Spiegelen (bijv. zodat iemand naar de tekst kijkt)') }, required: ['design_id', 'element_id'] } },
+  { name: 'fit_image', description: 'Past een fotokader aan de foto aan. contain = kader krijgt de verhouding van de foto (niets wordt afgesneden), cover_frame = foto vult het hele formaat als achtergrondlaag.', inputSchema: { type: 'object', properties: { design_id: DESIGN, element_id: S.str('Afbeeldingselement'), mode: { type: 'string', enum: ['contain', 'cover_frame'] } }, required: ['design_id', 'element_id', 'mode'] } },
+  { name: 'list_fonts', description: 'Lettertypes die zeker goed werken (alle Google Fonts kunnen, deze zijn geladen en getest).', inputSchema: { type: 'object', properties: {} } },
+  // ---- meerdere dingen tegelijk
+  { name: 'add_many', description: 'Voegt in één keer meerdere elementen toe. Elk item heeft "tool" (add_text, add_shape, add_image of add_icon) plus de argumenten van die tool (zonder design_id). Sneller dan losse aanroepen; je ziet de cursor alles één voor één plaatsen.', inputSchema: { type: 'object', properties: { design_id: DESIGN, items: { type: 'array', items: { type: 'object' } }, preview: S.bool('Daarna een live beeld terugsturen') }, required: ['design_id', 'items'] } },
+  { name: 'update_many', description: 'Past meerdere elementen in één keer aan: updates = [{element_id, props}] met dezelfde props als update_element.', inputSchema: { type: 'object', properties: { design_id: DESIGN, updates: { type: 'array', items: { type: 'object', properties: { element_id: { type: 'string' }, props: { type: 'object' } } } }, preview: S.bool('Daarna een live beeld terugsturen') }, required: ['design_id', 'updates'] } },
+  { name: 'duplicate_element', description: 'Dupliceert een element, optioneel verschoven of naar een ander formaat (meegeschaald).', inputSchema: { type: 'object', properties: { design_id: DESIGN, element_id: S.str('Element'), dx: S.num('Verschuiving x'), dy: S.num('Verschuiving y'), to_frame_id: S.str('Naar dit formaat kopiëren') }, required: ['design_id', 'element_id'] } },
+  { name: 'align_elements', description: 'Lijnt elementen uit: left, center, right, top, middle, bottom. relative_to frame (het formaat) of selection (de elementen onderling).', inputSchema: { type: 'object', properties: { design_id: DESIGN, element_ids: { type: 'array', items: { type: 'string' } }, align: { type: 'string', enum: ['left', 'center', 'right', 'top', 'middle', 'bottom'] }, relative_to: { type: 'string', enum: ['frame', 'selection'] }, margin: S.num('Marge tot de rand bij relative_to frame') }, required: ['design_id', 'element_ids', 'align'] } },
+  { name: 'distribute_elements', description: 'Verdeelt elementen met gelijke tussenruimte, horizontaal of verticaal.', inputSchema: { type: 'object', properties: { design_id: DESIGN, element_ids: { type: 'array', items: { type: 'string' } }, axis: { type: 'string', enum: ['horizontal', 'vertical'] } }, required: ['design_id', 'element_ids', 'axis'] } },
+  // ---- formaten
+  { name: 'copy_to_all_formats', description: 'Zet het ontwerp van één formaat slim om naar alle andere formaten (tekst blijft leesbaar, knoppen schalen mee met hun tekst, stories binnen de veilige zones). Overschrijft de inhoud van die formaten. Controleer daarna elk formaat met get_preview en verfijn per formaat.', inputSchema: { type: 'object', properties: { design_id: DESIGN, from_frame_id: S.str('Bronformaat'), to_frame_ids: { type: 'array', items: { type: 'string' }, description: 'Alleen deze formaten (leeg = alle andere)' } }, required: ['design_id', 'from_frame_id'] } },
+  { name: 'delete_format', description: 'Verwijdert een formaat uit het ontwerp.', inputSchema: { type: 'object', properties: { design_id: DESIGN, frame_id: S.str('Formaat') }, required: ['design_id', 'frame_id'] } },
+  { name: 'export_image', description: 'Exporteert een formaat als PNG in volle resolutie en geeft een downloadlink. Voor GIF, video en HTML5-zips gebruikt de gebruiker Exporteren in Adwerk.', inputSchema: { type: 'object', properties: { design_id: DESIGN, frame_id: S.str('Formaat'), scale: S.num('1 = ware grootte, 2 = dubbel') }, required: ['design_id', 'frame_id'] } },
+  // ---- ontwerpen en projecten
+  { name: 'rename_design', description: 'Geeft een ontwerp een nieuwe naam.', inputSchema: { type: 'object', properties: { design_id: DESIGN, title: S.str('Nieuwe naam') }, required: ['design_id', 'title'] } },
+  { name: 'duplicate_design', description: 'Kopieert een ontwerp, optioneel naar een project.', inputSchema: { type: 'object', properties: { design_id: DESIGN, title: S.str('Naam van de kopie'), project_id: S.str('In dit project zetten') }, required: ['design_id'] } },
+  { name: 'share_design', description: 'Deelt een ontwerp met het hele team of maakt het weer privé; of voegt specifieke collega\'s toe (e-mailadressen).', inputSchema: { type: 'object', properties: { design_id: DESIGN, with_team: S.bool('true = hele team, false = privé'), add_emails: { type: 'array', items: { type: 'string' } }, remove_emails: { type: 'array', items: { type: 'string' } } }, required: ['design_id'] } },
+  { name: 'set_template', description: 'Maakt van een ontwerp een teamtemplate (of haalt die status weg).', inputSchema: { type: 'object', properties: { design_id: DESIGN, is_template: S.bool('true of false') }, required: ['design_id', 'is_template'] } },
+  { name: 'delete_design', description: 'Verwijdert een eigen ontwerp definitief. Alleen doen als de gebruiker daar expliciet om vraagt; zet confirm op true.', inputSchema: { type: 'object', properties: { design_id: DESIGN, confirm: S.bool('Moet true zijn') }, required: ['design_id', 'confirm'] } },
+  { name: 'list_projects', description: 'Projecten (mappen per klant) met het aantal ontwerpen.', inputSchema: { type: 'object', properties: {} } },
+  { name: 'create_project', description: 'Maakt een project (map), bijvoorbeeld per klant.', inputSchema: { type: 'object', properties: { name: S.str('Naam, bijv. klantnaam'), share_with_team: S.bool('Zichtbaar voor het team (standaard ja)') }, required: ['name'] } },
+  { name: 'update_project', description: 'Hernoemt een project of verandert de zichtbaarheid.', inputSchema: { type: 'object', properties: { project_id: S.str('Project'), name: S.str('Nieuwe naam'), share_with_team: S.bool('Zichtbaar voor het team') }, required: ['project_id'] } },
+  { name: 'delete_project', description: 'Verwijdert een eigen project. De ontwerpen erin blijven bestaan (zonder project). Alleen op expliciet verzoek; confirm true.', inputSchema: { type: 'object', properties: { project_id: S.str('Project'), confirm: S.bool('Moet true zijn') }, required: ['project_id', 'confirm'] } },
+  { name: 'move_design', description: 'Verplaatst een ontwerp naar een project, of uit een project (project_id leeg).', inputSchema: { type: 'object', properties: { design_id: DESIGN, project_id: S.str('Doelproject; leeg = geen project') }, required: ['design_id'] } },
+  // ---- uploads
+  { name: 'update_asset', description: 'Hernoemt een upload of deelt hem met het team.', inputSchema: { type: 'object', properties: { asset_id: S.str('Upload (uit list_assets)'), name: S.str('Nieuwe naam'), shared: S.bool('Delen met team') }, required: ['asset_id'] } },
+  { name: 'delete_asset', description: 'Verwijdert een eigen upload. Alleen op expliciet verzoek; confirm true.', inputSchema: { type: 'object', properties: { asset_id: S.str('Upload'), confirm: S.bool('Moet true zijn') }, required: ['asset_id', 'confirm'] } },
+  // ---- animatie
+  { name: 'set_animations', description: 'Zet animaties voor meerdere elementen tegelijk aan, uit of anders. items = [{element_id, in?, out?, emphasis?}] zoals bij animate_element. Gebruik type "none" om een animatie uit te zetten.', inputSchema: { type: 'object', properties: { design_id: DESIGN, items: { type: 'array', items: { type: 'object' } } }, required: ['design_id', 'items'] } },
+  { name: 'clear_animations', description: 'Zet alle animaties uit: van één element (element_id) of van een heel formaat (frame_id, of "all").', inputSchema: { type: 'object', properties: { design_id: DESIGN, element_id: S.str('Element'), frame_id: S.str('Formaat of "all"') }, required: ['design_id'] } },
+  { name: 'animation_preset', description: 'Kant-en-klare animatie voor een heel formaat: stagger_up (alles schuift na elkaar omhoog in, achtergrondvlakken eerst), fade_in (alles vervaagt in), pop_cta (tekst schuift in, de knop ploft en pulseert), ken_burns (foto zoomt langzaam, tekst komt erna), none (alles uit). Houdt rekening met de duur van het formaat.', inputSchema: { type: 'object', properties: { design_id: DESIGN, frame_id: S.str('Formaat of "all"'), preset: { type: 'string', enum: ['stagger_up', 'fade_in', 'pop_cta', 'ken_burns', 'none'] }, duration: S.num('Totale duur van het formaat in seconden (optioneel)') }, required: ['design_id', 'preset'] } },
+  { name: 'preview_animation', description: 'Filmstrip van de animatie: beelden op meerdere momenten (standaard 0,3s, 0,8s, 1,5s, halverwege en het einde) zodat je kunt zien of alles goed binnenkomt, niet te druk is en het eindbeeld klopt.', inputSchema: { type: 'object', properties: { design_id: DESIGN, frame_id: S.str('Formaat'), times: { type: 'array', items: { type: 'number' }, description: 'Momenten in seconden' }, size: S.num('Langste zijde per beeld (standaard 600)') }, required: ['design_id', 'frame_id'] } },
 ]
 
 async function call(name: string, a: Json, ctx: Ctx) {
@@ -466,6 +977,11 @@ async function call(name: string, a: Json, ctx: Ctx) {
         else if (h && !w) w = h * ratio
         proto = baseEl('image', String(a.name || 'Afbeelding'), { src: img.url, width: Math.round(w), height: Math.round(h), cropZoom: 1, cropX: 0.5, cropY: 0.5, fill: '#D9D6E3', mask: (a.mask as string) || 'none', cornerRadius: num(a.corner_radius, 0) })
         proto.x = num(a.x, Math.round((ref.w - w) / 2)); proto.y = num(a.y, Math.round((ref.h - h) / 2))
+        if (a.focus_x !== undefined || a.focus_y !== undefined) {
+          const sc = Math.max(w / img.w, h / img.h), cw = w / sc, ch = h / sc, cl = (v: number) => Math.min(1, Math.max(0, v))
+          proto.cropX = img.w - cw > 0.5 ? cl((num(a.focus_x, 0.5) * img.w - cw / 2) / (img.w - cw)) : 0.5
+          proto.cropY = img.h - ch > 0.5 ? cl((num(a.focus_y, 0.5) * img.h - ch / 2) / (img.h - ch)) : 0.5
+        }
       } else {
         const { svg, multi } = await iconSvg(String(a.icon))
         const size = num(a.size, Math.round(Math.min(ref.w, ref.h) * 0.16))
@@ -606,6 +1122,335 @@ async function call(name: string, a: Json, ctx: Ctx) {
       const { data } = await q
       return ok(data || [])
     }
+    /* ---------------- kijken en controleren */
+    case 'get_preview': return { content: await previewContent(String(a.design_id), ctx, { frame_id: a.frame_id as string | undefined, time: a.time as number | undefined, size: a.size as number | undefined, checks: a.checks as boolean | undefined }) }
+
+    case 'check_design': {
+      const row = await loadDesign(String(a.design_id), ctx)
+      const frames = a.frame_id ? pickFrames(row.data, String(a.frame_id)) : row.data.frames
+      const out: string[] = []
+      for (const f of frames) { const c = await checkFrame(f); out.push(`${f.name} (${f.id}): ${c.length ? '\n- ' + c.join('\n- ') : 'geen problemen gevonden'}`) }
+      return ok(out.join('\n\n'))
+    }
+
+    case 'view_image': {
+      let src = a.url ? String(a.url) : ''
+      if (!src && a.element_id) { const row = await loadDesign(String(a.design_id), ctx); src = String(findEl(row.data, String(a.element_id)).el.src || '') }
+      if (!src) throw new Error('Geef een element_id van een afbeelding of een url')
+      const r = await renderImageGrid(src, Math.max(300, Math.min(1400, num(a.size, 900))))
+      return { content: [{ type: 'text', text: `Volledige foto, ${r.w}×${r.h}px (verhouding ${(r.w / r.h).toFixed(2)}). Rasterlijnen per 0,1; de roze lijnen zijn het midden. Gebruik deze waarden als focus_x en focus_y in set_image_crop.` }, { type: 'image', data: b64(r.png), mimeType: 'image/png' }] }
+    }
+
+    case 'set_image_crop': {
+      const id = String(a.design_id), elId = String(a.element_id)
+      const row = await loadDesign(id, ctx)
+      const { frame, el } = findEl(row.data, elId)
+      if (el.type !== 'image' || !el.src) throw new Error('Dit is geen afbeelding met een foto')
+      const d = await imageDims(String(el.src))
+      if (!d) throw new Error('Foto kon niet worden geladen')
+      const zoom = Math.max(1, num(a.zoom, Number(el.cropZoom) || 1))
+      const s = Math.max(el.width / d.w, el.height / d.h) * zoom, cw = el.width / s, ch = el.height / s
+      const fx = num(a.focus_x, 0.5), fy = num(a.focus_y, 0.5)
+      const cropX = d.w - cw > 0.5 ? Math.min(1, Math.max(0, (fx * d.w - cw / 2) / (d.w - cw))) : 0.5
+      const cropY = d.h - ch > 0.5 ? Math.min(1, Math.max(0, (fy * d.h - ch / 2) / (d.h - ch))) : 0.5
+      const live = new Live(id, ctx, frame.id)
+      await live.moveTo(el.x + el.width / 2, el.y + el.height / 2, 'uitsnede kiezen')
+      await live.click([elId])
+      await editDesign(id, ctx, (doc) => { Object.assign(findEl(doc, elId).el, { cropZoom: zoom, cropX: r1(cropX * 1000) / 1000, cropY: r1(cropY * 1000) / 1000, ...(a.flip_x !== undefined ? { flipX: !!a.flip_x } : {}) }) })
+      await live.status('klaar', [elId])
+      const visible = { left: r1(((d.w - cw) * cropX) / d.w * 100) / 100, top: r1(((d.h - ch) * cropY) / d.h * 100) / 100, width: r1(cw / d.w * 100) / 100, height: r1(ch / d.h * 100) / 100 }
+      return ok({ element_id: elId, zoom, visible_part_of_photo: visible, tip: 'Controleer met get_preview of hoofden, handen en het product helemaal in beeld zijn.' })
+    }
+
+    case 'fit_image': {
+      const id = String(a.design_id), elId = String(a.element_id)
+      const row = await loadDesign(id, ctx)
+      const { el, frame } = findEl(row.data, elId)
+      const d = el.src ? await imageDims(String(el.src)) : null
+      if (!d) throw new Error('Foto kon niet worden geladen')
+      const live = new Live(id, ctx, frame.id)
+      await live.moveTo(el.x + el.width / 2, el.y + el.height / 2, 'kader passend maken')
+      await live.click([elId])
+      await editDesign(id, ctx, (doc) => {
+        const { el: e, frame: f, index } = findEl(doc, elId)
+        if (a.mode === 'cover_frame') { Object.assign(e, { x: 0, y: 0, width: f.w, height: f.h, cropZoom: 1, cropX: 0.5, cropY: 0.5, mask: 'none', cornerRadius: 0 }); f.elements.splice(index, 1); f.elements.unshift(e) }
+        else { const h = e.width * d.h / d.w; Object.assign(e, { y: e.y + (e.height - h) / 2, height: Math.round(h), cropZoom: 1, cropX: 0.5, cropY: 0.5 }) }
+      })
+      await live.status('klaar', [elId])
+      return ok('Kader aangepast')
+    }
+
+    case 'list_fonts': return ok({ fonts: FONTS, tip: 'Poppins (koppen vet, tekst regular) en Caveat (handgeschreven accent) zijn de huisstijl van daar-om.nl. Combineer maximaal twee lettertypes.' })
+
+    /* ---------------- meerdere dingen tegelijk */
+    case 'add_many': {
+      const results: unknown[] = []
+      for (const it of (Array.isArray(a.items) ? a.items as Json[] : [])) {
+        const tool = String(it.tool)
+        if (!['add_text', 'add_shape', 'add_image', 'add_icon'].includes(tool)) { results.push({ error: `Onbekende tool ${tool}` }); continue }
+        try { const r = await call(tool, { ...it, design_id: a.design_id }, ctx) as { content: { text: string }[] }; results.push({ tool, ...JSON.parse(r.content[0].text) }) }
+        catch (e) { results.push({ tool, error: (e as Error).message }) }
+      }
+      return ok(results)
+    }
+
+    case 'update_many': {
+      const results: unknown[] = []
+      for (const u of (Array.isArray(a.updates) ? a.updates as Json[] : [])) {
+        try { await call('update_element', { design_id: a.design_id, element_id: u.element_id, props: u.props }, ctx); results.push({ element_id: u.element_id, ok: true }) }
+        catch (e) { results.push({ element_id: u.element_id, error: (e as Error).message }) }
+      }
+      return ok(results)
+    }
+
+    case 'duplicate_element': {
+      const id = String(a.design_id), elId = String(a.element_id)
+      const row = await loadDesign(id, ctx)
+      const { frame, el } = findEl(row.data, elId)
+      const live = new Live(id, ctx, frame.id)
+      await live.moveTo(el.x + el.width / 2, el.y + el.height / 2, 'dupliceren')
+      await live.click([elId])
+      let newId = ''
+      await editDesign(id, ctx, (doc) => {
+        const { el: e, frame: f } = findEl(doc, elId)
+        const target = a.to_frame_id ? pickFrames(doc, String(a.to_frame_id))[0] : f
+        const n = clone(e); n.id = uid(); newId = n.id
+        if (target.id !== f.id) { const b = mapBox(f, target, e); Object.assign(n, { x: b.x, y: b.y, width: b.width, height: b.height }); if (n.type === 'text') n.fontSize = Math.max(6, Math.round(Number(n.fontSize) * b.k)) }
+        n.x += num(a.dx, target.id === f.id ? 24 : 0); n.y += num(a.dy, target.id === f.id ? 24 : 0)
+        target.elements.push(n)
+      })
+      await live.status('klaar', [newId])
+      return ok({ element_id: newId })
+    }
+
+    case 'align_elements': case 'distribute_elements': {
+      const id = String(a.design_id), ids = (a.element_ids || []) as string[]
+      if (!ids.length) throw new Error('Geef element_ids')
+      const row = await loadDesign(id, ctx)
+      const first = findEl(row.data, ids[0])
+      const live = new Live(id, ctx, first.frame.id)
+      await live.moveTo(first.el.x + first.el.width / 2, first.el.y + first.el.height / 2, name === 'align_elements' ? 'uitlijnen' : 'verdelen', ids)
+      await live.click(ids)
+      await editDesign(id, ctx, (doc) => {
+        const els = ids.map((i) => findEl(doc, i).el), f = findEl(doc, ids[0]).frame
+        if (name === 'align_elements') {
+          const sel = a.relative_to === 'selection' && els.length > 1, m = num(a.margin, 0)
+          const minX = sel ? Math.min(...els.map((e) => e.x)) : m, maxX = sel ? Math.max(...els.map((e) => e.x + e.width)) : f.w - m
+          const minY = sel ? Math.min(...els.map((e) => e.y)) : m, maxY = sel ? Math.max(...els.map((e) => e.y + e.height)) : f.h - m
+          for (const e of els) {
+            if (a.align === 'left') e.x = minX
+            if (a.align === 'right') e.x = maxX - e.width
+            if (a.align === 'center') e.x = (minX + maxX) / 2 - e.width / 2
+            if (a.align === 'top') e.y = minY
+            if (a.align === 'bottom') e.y = maxY - e.height
+            if (a.align === 'middle') e.y = (minY + maxY) / 2 - e.height / 2
+          }
+        } else {
+          const hor = a.axis !== 'vertical'
+          const sorted = [...els].sort((p, q) => (hor ? p.x - q.x : p.y - q.y))
+          const start = hor ? sorted[0].x : sorted[0].y
+          const end = hor ? sorted[sorted.length - 1].x + sorted[sorted.length - 1].width : sorted[sorted.length - 1].y + sorted[sorted.length - 1].height
+          const total = sorted.reduce((s, e) => s + (hor ? e.width : e.height), 0)
+          const gap = (end - start - total) / Math.max(1, sorted.length - 1)
+          let pos = start
+          for (const e of sorted) { if (hor) e.x = pos; else e.y = pos; pos += (hor ? e.width : e.height) + gap }
+        }
+      })
+      await live.status('klaar', ids)
+      return ok('Klaar')
+    }
+
+    /* ---------------- formaten */
+    case 'copy_to_all_formats': {
+      const id = String(a.design_id), from = String(a.from_frame_id)
+      const live = new Live(id, ctx, from)
+      await live.status('formaten omzetten')
+      let count = 0
+      await editDesign(id, ctx, (doc) => {
+        const src = pickFrames(doc, from)[0]
+        const targets = doc.frames.filter((f) => f.id !== src.id && (!Array.isArray(a.to_frame_ids) || (a.to_frame_ids as string[]).includes(f.id)))
+        for (const t of targets) { t.elements = smartResize(src, t); t.background = clone(src.background); t.duration = src.duration; count++ }
+      })
+      return ok({ converted_formats: count, tip: 'Bekijk elk formaat met get_preview; vooral smalle banners (728×90, 320×50) en stories hebben vaak een eigen indeling nodig.' })
+    }
+
+    case 'delete_format': {
+      const id = String(a.design_id)
+      await editDesign(id, ctx, (doc) => {
+        if (doc.frames.length <= 1) throw new Error('Een ontwerp heeft minstens één formaat nodig')
+        const f = pickFrames(doc, String(a.frame_id))[0]
+        doc.frames = doc.frames.filter((x) => x.id !== f.id)
+      })
+      return ok('Formaat verwijderd')
+    }
+
+    case 'export_image': {
+      const row = await loadDesign(String(a.design_id), ctx)
+      const f = pickFrames(row.data, String(a.frame_id))[0]
+      const scale = Math.max(0.25, Math.min(3, num(a.scale, 1)))
+      const live = await clientRender(row.id, [f.id], null, Math.round(Math.max(f.w, f.h) * scale))
+      const got = live?.get(f.id)
+      const bytes = got?.mime === 'image/png' ? got.bytes : await renderFramePng(f, null, Math.max(f.w, f.h) * scale)
+      const path = `${ctx.userId}/exports/${crypto.randomUUID()}.png`
+      await db.storage.from('assets').upload(path, bytes, { contentType: 'image/png' })
+      return ok({ url: db.storage.from('assets').getPublicUrl(path).data.publicUrl, width: Math.round(f.w * scale), height: Math.round(f.h * scale) })
+    }
+
+    /* ---------------- ontwerpen en projecten */
+    case 'rename_design': {
+      const d = await loadDesign(String(a.design_id), ctx)
+      await db.from('designs').update({ title: String(a.title), updated_by: ctx.userId }).eq('id', d.id)
+      return ok('Naam aangepast')
+    }
+    case 'duplicate_design': {
+      const d = await loadDesign(String(a.design_id), ctx)
+      const doc = clone(d.data)
+      for (const f of doc.frames) { f.id = uid(); f.elements.forEach((e) => { e.id = uid() }) }
+      const { data, error } = await db.from('designs').insert({ title: String(a.title || `${d.title} (kopie)`), data: doc, owner_id: ctx.userId, updated_by: ctx.userId, visibility: d.visibility, folder_id: a.project_id || (d as unknown as { folder_id: string | null }).folder_id || null }).select('id').single()
+      if (error) throw new Error('Kopiëren mislukt')
+      return ok({ id: data.id, url: designUrl(data.id) })
+    }
+    case 'share_design': {
+      const d = await loadDesign(String(a.design_id), ctx)
+      if (a.with_team !== undefined) {
+        if (d.owner_id !== ctx.userId) throw new Error('Alleen de eigenaar kan de zichtbaarheid aanpassen')
+        await db.from('designs').update({ visibility: a.with_team ? 'team' : 'private' }).eq('id', d.id)
+      }
+      const emails = [...((a.add_emails || []) as string[]), ...((a.remove_emails || []) as string[])]
+      if (emails.length) {
+        if (d.owner_id !== ctx.userId) throw new Error('Alleen de eigenaar kan collega\'s toevoegen')
+        const { data: profs } = await db.from('profiles').select('id,email').in('email', emails.map((e) => e.toLowerCase()))
+        const byMail = new Map((profs || []).map((p: { id: string; email: string }) => [p.email.toLowerCase(), p.id]))
+        for (const e of (a.add_emails || []) as string[]) { const uidp = byMail.get(e.toLowerCase()); if (uidp) await db.from('design_members').upsert({ design_id: d.id, user_id: uidp }) }
+        for (const e of (a.remove_emails || []) as string[]) { const uidp = byMail.get(e.toLowerCase()); if (uidp) await db.from('design_members').delete().eq('design_id', d.id).eq('user_id', uidp) }
+      }
+      return ok('Delen bijgewerkt')
+    }
+    case 'set_template': {
+      const d = await loadDesign(String(a.design_id), ctx)
+      await db.from('designs').update({ is_template: !!a.is_template }).eq('id', d.id)
+      return ok(a.is_template ? 'Staat nu bij de teamtemplates' : 'Geen template meer')
+    }
+    case 'delete_design': {
+      if (a.confirm !== true) throw new Error('Zet confirm op true, en alleen als de gebruiker dit expliciet vroeg')
+      const d = await loadDesign(String(a.design_id), ctx)
+      if (d.owner_id !== ctx.userId) throw new Error('Je kunt alleen je eigen ontwerpen verwijderen')
+      await db.from('designs').delete().eq('id', d.id)
+      return ok('Ontwerp verwijderd')
+    }
+    case 'list_projects': {
+      const { data } = await db.from('folders').select('id,name,owner_id,visibility').order('name')
+      const rows = (data || []).filter((f: { owner_id: string; visibility: string }) => f.owner_id === ctx.userId || f.visibility === 'team')
+      const out = []
+      for (const f of rows as { id: string; name: string; owner_id: string; visibility: string }[]) {
+        const { count } = await db.from('designs').select('id', { count: 'exact', head: true }).eq('folder_id', f.id)
+        out.push({ id: f.id, name: f.name, mine: f.owner_id === ctx.userId, shared_with_team: f.visibility === 'team', designs: count || 0 })
+      }
+      return ok(out)
+    }
+    case 'create_project': {
+      const { data, error } = await db.from('folders').insert({ name: String(a.name), owner_id: ctx.userId, visibility: a.share_with_team === false ? 'private' : 'team' }).select('id,name').single()
+      if (error) throw new Error('Project aanmaken mislukt')
+      return ok(data)
+    }
+    case 'update_project': {
+      const { data: f } = await db.from('folders').select('*').eq('id', String(a.project_id)).maybeSingle()
+      if (!f || (f.owner_id !== ctx.userId && f.visibility !== 'team')) throw new Error('Project niet gevonden')
+      const patch: Json = {}
+      if (a.name) patch.name = String(a.name)
+      if (a.share_with_team !== undefined) { if (f.owner_id !== ctx.userId) throw new Error('Alleen de eigenaar kan de zichtbaarheid aanpassen'); patch.visibility = a.share_with_team ? 'team' : 'private' }
+      await db.from('folders').update(patch).eq('id', f.id)
+      return ok('Project bijgewerkt')
+    }
+    case 'delete_project': {
+      if (a.confirm !== true) throw new Error('Zet confirm op true, en alleen als de gebruiker dit expliciet vroeg')
+      const { data: f } = await db.from('folders').select('*').eq('id', String(a.project_id)).maybeSingle()
+      if (!f || f.owner_id !== ctx.userId) throw new Error('Je kunt alleen je eigen projecten verwijderen')
+      await db.from('designs').update({ folder_id: null }).eq('folder_id', f.id)
+      await db.from('folders').delete().eq('id', f.id)
+      return ok('Project verwijderd; de ontwerpen staan nu zonder project')
+    }
+    case 'move_design': {
+      const d = await loadDesign(String(a.design_id), ctx)
+      if (a.project_id) { const { data: f } = await db.from('folders').select('id,owner_id,visibility').eq('id', String(a.project_id)).maybeSingle(); if (!f || (f.owner_id !== ctx.userId && f.visibility !== 'team')) throw new Error('Project niet gevonden') }
+      await db.from('designs').update({ folder_id: a.project_id || null }).eq('id', d.id)
+      return ok(a.project_id ? 'Verplaatst naar het project' : 'Uit het project gehaald')
+    }
+
+    /* ---------------- uploads */
+    case 'update_asset': {
+      const { data: as } = await db.from('assets').select('id,owner_id').eq('id', String(a.asset_id)).maybeSingle()
+      if (!as || as.owner_id !== ctx.userId) throw new Error('Alleen je eigen uploads')
+      const patch: Json = {}
+      if (a.name) patch.name = String(a.name)
+      if (a.shared !== undefined) patch.shared = !!a.shared
+      await db.from('assets').update(patch).eq('id', as.id)
+      return ok('Upload bijgewerkt')
+    }
+    case 'delete_asset': {
+      if (a.confirm !== true) throw new Error('Zet confirm op true, en alleen als de gebruiker dit expliciet vroeg')
+      const { data: as } = await db.from('assets').select('id,owner_id,path').eq('id', String(a.asset_id)).maybeSingle()
+      if (!as || as.owner_id !== ctx.userId) throw new Error('Alleen je eigen uploads')
+      await db.storage.from('assets').remove([as.path])
+      await db.from('assets').delete().eq('id', as.id)
+      return ok('Upload verwijderd')
+    }
+
+    /* ---------------- animatie */
+    case 'set_animations': {
+      const results: unknown[] = []
+      for (const it of (Array.isArray(a.items) ? a.items as Json[] : [])) {
+        try { await call('animate_element', { ...it, design_id: a.design_id }, ctx); results.push({ element_id: it.element_id, ok: true }) }
+        catch (e) { results.push({ element_id: it.element_id, error: (e as Error).message }) }
+      }
+      return ok(results)
+    }
+    case 'clear_animations': {
+      const id = String(a.design_id)
+      const none = () => ({ in: { type: 'none', delay: 0, duration: 0.6 }, out: { type: 'none', delay: 0, duration: 0.5 }, emph: { type: 'none', speed: 1 } })
+      await editDesign(id, ctx, (doc) => {
+        if (a.element_id) findEl(doc, String(a.element_id)).el.anim = none()
+        else for (const f of pickFrames(doc, String(a.frame_id || 'all'))) f.elements.forEach((e) => { e.anim = none() })
+      })
+      return ok('Animaties uitgezet')
+    }
+    case 'animation_preset': {
+      const id = String(a.design_id), preset = String(a.preset)
+      await editDesign(id, ctx, (doc) => {
+        for (const f of pickFrames(doc, String(a.frame_id || 'all'))) {
+          if (a.duration) f.duration = Math.max(1, Math.min(30, num(a.duration, f.duration)))
+          const els = f.elements.filter((e) => e.visible)
+          const big = (e: El) => e.width * e.height > f.w * f.h * 0.5
+          const isCta = (e: El) => e.type === 'rect' && e.cornerRadius > 0 && e.width < f.w * 0.7 && e.height < f.h * 0.25
+          const ctaText = (e: El) => e.type === 'text' && els.some((c) => isCta(c) && e.x + e.width / 2 > c.x && e.x + e.width / 2 < c.x + c.width && e.y + e.height / 2 > c.y && e.y + e.height / 2 < c.y + c.height)
+          let step = 0
+          const order = [...els].sort((p, q) => (big(q) ? 1 : 0) - (big(p) ? 1 : 0) || p.y - q.y)
+          for (const e of order) {
+            const an = { in: { type: 'none', delay: 0, duration: 0.6 }, out: { type: 'none', delay: 0, duration: 0.5 }, emph: { type: 'none', speed: 1 } }
+            if (preset === 'stagger_up') an.in = big(e) ? { type: 'fade', delay: 0, duration: 0.5 } : { type: 'slideUp', delay: r1(0.15 + step++ * 0.18), duration: 0.6 }
+            if (preset === 'fade_in') an.in = { type: 'fade', delay: r1(step++ * 0.12), duration: 0.7 }
+            if (preset === 'pop_cta') {
+              if (isCta(e) || ctaText(e)) { an.in = { type: 'pop', delay: 1.2, duration: 0.5 }; an.emph = { type: 'pulse', speed: 1 } }
+              else an.in = big(e) ? { type: 'fade', delay: 0, duration: 0.4 } : { type: 'slideUp', delay: r1(0.1 + step++ * 0.2), duration: 0.6 }
+            }
+            if (preset === 'ken_burns') {
+              if (e.type === 'image' && big(e)) { an.in = { type: 'zoomOut', delay: 0, duration: Math.max(1, f.duration - 0.2) } }
+              else an.in = { type: 'fade', delay: r1(0.4 + step++ * 0.2), duration: 0.6 }
+            }
+            e.anim = an
+          }
+        }
+      })
+      return ok('Animatie ingesteld. Bekijk het resultaat met preview_animation.')
+    }
+    case 'preview_animation': {
+      const row = await loadDesign(String(a.design_id), ctx)
+      const f = pickFrames(row.data, String(a.frame_id))[0]
+      const times = (Array.isArray(a.times) && a.times.length ? a.times as number[] : [0.3, 0.8, 1.5, f.duration / 2, f.duration]).slice(0, 8)
+      const content: Json[] = [{ type: 'text', text: `Filmstrip van ${f.name} (${f.duration}s)` }]
+      for (const t of times) content.push(...(await previewContent(row.id, ctx, { frame_id: f.id, time: t, size: num(a.size, 600), checks: false })))
+      return { content }
+    }
   }
   throw new Error(`Onbekende tool: ${name}`)
 }
@@ -628,11 +1473,41 @@ async function auth(req: Request): Promise<Ctx | null> {
   return { userId: data.user_id, agentName: data.name || 'Claude', agentKey: `agent:${data.id}` }
 }
 
-const INSTRUCTIONS = `Adwerk is de ontwerptool van daar-om.nl voor social ads, HTML5-bannersets en GIF's.
-Werkwijze: 1) list_designs of create_design, 2) get_design voor formaat- en element-id's, 3) bouw met add_text, add_shape, add_image, add_icon, set_background, 4) verfijn met update_element, arrange_element en animate_element.
-Coördinaten zijn pixels binnen een formaat (0,0 is linksboven). Laag 0 ligt achteraan; nieuwe elementen komen vooraan.
-Wie het ontwerp open heeft, ziet jouw cursor live bewegen en je wijzigingen direct verschijnen. Geef de gebruiker de url zodat die kan meekijken.
-Ontwerp in de huisstijl van de klant (list_brand_kits). Gebruik geen gedachtestreepjes in teksten.`
+const INSTRUCTIONS = `Adwerk is de ontwerptool van daar-om.nl voor social ads, HTML5-bannersets en GIF's. Jij werkt live mee: wie het ontwerp open heeft, ziet jouw cursor en elke wijziging direct. Geef de gebruiker altijd de url van het ontwerp.
+
+WERKWIJZE
+1. Begrijp de opdracht: klant, doel (bereik, klikken, leads), doelgroep, kanaal en formaten. Haal de huisstijl op met list_brand_kits.
+2. list_designs of create_design (een set: social, google, linkedin, demandgen). Zet het ontwerp in het project van de klant (list_projects, create_project, move_design).
+3. Ontwerp eerst één hoofdformaat (meestal 1080×1080). Gebruik add_many om in één keer op te bouwen.
+4. Kijk ALTIJD met get_preview (of preview: true bij een tool) en los alles op wat de controle meldt én wat je zelf ziet. Herhaal tot het echt goed is. Stop nooit zonder een laatste get_preview van elk formaat.
+5. Zet daarna om met copy_to_all_formats en controleer en verfijn elk formaat apart: een 728×90 of 320×50 heeft een eigen indeling nodig (logo links, korte kop midden, knop rechts), een story houdt boven 14% en onder 20% vrij.
+6. Animatie: animation_preset of set_animations, controleer met preview_animation. Kort en rustig: alles binnen 2 seconden in beeld, één nadruk-animatie op de knop. Google Ads max 30s.
+
+FOTO'S (de meest gemaakte fouten)
+- Bekijk een foto altijd eerst volledig met view_image voordat je hem plaatst of uitsnijdt.
+- Snij nooit hoofden, kin, voorhoofd, handen of voeten van personen af en snij nooit door gewrichten (pols, elleboog, knie, enkel). Laat ruimte boven het hoofd.
+- Zet de ogen op ongeveer een derde van boven. Gebruik set_image_crop met focus_x en focus_y op het punt tussen de ogen (iets erboven bij close-ups).
+- Laat een persoon de advertentie in kijken (richting de tekst), niet eruit; spiegel met flip_x als dat de foto niet onnatuurlijk maakt (nooit bij tekst, logo's of merkproducten in beeld).
+- Producten helemaal in beeld, niet afgesneden aan de rand. Groepsfoto's: niemand half in beeld.
+- Gebruik een mask (circle, arch) alleen als het onderwerp er ruim in past.
+- Geen tekst over gezichten of het product. Tekst op een foto: zet een vlak of donker verloop eronder of kies een rustig deel van de foto.
+- Vergroot kleine foto's niet sterk op (wazig). Voorkom dat een foto als achtergrond de tekst onleesbaar maakt.
+
+TEKST EN OPMAAK
+- Hiërarchie: één duidelijke kop (groot en vet), hooguit één ondersteunende regel, één call to action als knop. In banners nog korter.
+- Leesbaar op mobiel: kop op 1080px minimaal ~60px, bodytekst minimaal ~30px; in kleine banners minimaal 11 tot 12px.
+- Contrast minimaal 4,5:1 (grote koppen 3:1). Wit op Spot Oranje (#EA5F39) is te zwak; gebruik #CC4A25 of donkere tekst.
+- Marge: houd ongeveer 5% van de korte zijde vrij aan alle randen. Lijn elementen op elkaar uit (align_elements), gelijke tussenruimtes (distribute_elements).
+- Knoppen: tekst gecentreerd in het vlak (zelfde breedte en x als de knop, align center), ruim binnen de knop.
+- Maximaal twee lettertypes. Geen woorden die halverwege afbreken: maak het tekstvak breder of de letter kleiner.
+- Schrijf in het Nederlands, actief en concreet; gebruik je of u zoals de klant. Gebruik geen gedachtestreepjes in teksten.
+- Logo altijd zichtbaar en niet vervormd, op een rustige plek met ruimte eromheen.
+
+COÖRDINATEN
+Pixels binnen een formaat, 0,0 is linksboven. Laag 0 ligt achteraan; nieuwe elementen komen vooraan (arrange_element om te ordenen). frame_id "all" plaatst iets in alle formaten, meegeschaald vanaf het eerste.
+
+VEILIGHEID
+Verwijder ontwerpen, projecten of uploads alleen als de gebruiker daar expliciet om vraagt (confirm: true).`
 
 async function rpc(msg: { jsonrpc: string; id?: string | number; method: string; params?: Json }, ctx: Ctx) {
   const { id, method, params } = msg
@@ -643,9 +1518,21 @@ async function rpc(msg: { jsonrpc: string; id?: string | number; method: string;
     switch (method) {
       case 'initialize': return res({ protocolVersion: (params?.protocolVersion as string) || '2025-06-18', capabilities: { tools: { listChanged: false } }, serverInfo: { name: 'adwerk', title: 'Adwerk', version: '1.0.0' }, instructions: INSTRUCTIONS })
       case 'ping': return res({})
-      case 'tools/list': return res({ tools: TOOLS })
+      case 'tools/list': return res({ tools: TOOLS.map((t) => PREVIEWABLE.includes(t.name) && !t.inputSchema.properties.preview ? { ...t, inputSchema: { ...t.inputSchema, properties: { ...t.inputSchema.properties, preview: S.bool('Stuur na afloop direct een live beeld en controle van het formaat terug (aanrader)') } } } : t) })
       case 'tools/call': {
-        try { return res(await call(String(params?.name), (params?.arguments || {}) as Json, ctx)) }
+        try {
+          const name = String(params?.name), args = (params?.arguments || {}) as Json
+          const out = await call(name, args, ctx) as { content: Json[] }
+          if (args.preview === true && PREVIEWABLE.includes(name) && args.design_id) {
+            let fid = args.frame_id as string | undefined
+            if (!fid || fid === 'all') {
+              try { const txt = String((out.content[0] as { text?: string }).text || ''); const m = txt.match(/"frame_id":\s*"([^"]+)"/); if (m) fid = m[1] } catch { /* geen id */ }
+              if (!fid && args.element_id) { const row = await loadDesign(String(args.design_id), ctx); fid = findEl(row.data, String(args.element_id)).frame.id }
+            }
+            out.content.push(...await previewContent(String(args.design_id), ctx, { frame_id: fid && fid !== 'all' ? fid : undefined }))
+          }
+          return res(out)
+        }
         catch (e) { return res({ content: [{ type: 'text', text: (e as Error).message }], isError: true }) }
       }
       case 'resources/list': return res({ resources: [] })
