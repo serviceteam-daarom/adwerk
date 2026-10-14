@@ -17,7 +17,7 @@ const db = createClient(SB_URL, SRK, { auth: { persistSession: false } })
 // deno-lint-ignore no-explicit-any
 type AnyEl = Record<string, any>
 // deno-lint-ignore no-explicit-any
-type AnyFrame = { w: number; h: number; duration: number; background: { type: string; color: string; color2: string; angle: number; src?: string }; elements: AnyEl[] }
+type AnyFrame = { w: number; h: number; duration: number; groups?: { id: string; name: string; anim?: AnyEl }[]; background: { type: string; color: string; color2: string; angle: number; src?: string }; elements: AnyEl[] }
 
 let wasm: Promise<void> | null = null
 const ensureWasm = () => (wasm ??= initWasm(fetch('https://unpkg.com/@resvg/resvg-wasm@2.6.2/index_bg.wasm')))
@@ -179,8 +179,10 @@ function emph(type: string, t: number, speed: number): St {
   if (type === 'blink') s.opacity = 0.35 + 0.65 * (0.5 + 0.5 * Math.cos(ph))
   return s
 }
-function stateAt(el: AnyEl, f: AnyFrame, t: number): St {
-  const a = el.anim, st: St = { dx: 0, dy: 0, scale: 1, rotation: 0, opacity: 1 }
+function stateAt(el: AnyEl, f: AnyFrame, t: number): St { return animAt(el.anim, f, t) }
+// deno-lint-ignore no-explicit-any
+function animAt(a: any, f: AnyFrame, t: number): St {
+  const st: St = { dx: 0, dy: 0, scale: 1, rotation: 0, opacity: 1 }
   if (!a) return st
   const dist = Math.round(Math.min(f.w, f.h) * 0.18), parts: St[] = []
   let inEnd = 0
@@ -260,6 +262,15 @@ async function frameSvg(f: AnyFrame, t: number | null = null) {
     if (im) { const c = cover(im.w, im.h, f.w, f.h); body += `<svg width="${f.w}" height="${f.h}" viewBox="${c.x} ${c.y} ${c.w} ${c.h}" preserveAspectRatio="none"><image width="${im.w}" height="${im.h}" href="${im.uri}"/></svg>` }
   }
 
+  // groepen met een eigen animatie: draaipunt = midden van de groep
+  const gstate = new Map<string, { s: St; px: number; py: number }>()
+  if (t !== null) for (const g of (f.groups || [])) {
+    if (!g.anim) continue
+    const m = f.elements.filter((e) => e.groupId === g.id)
+    if (!m.length) continue
+    const x0 = Math.min(...m.map((e) => e.x)), y0 = Math.min(...m.map((e) => e.y)), x1 = Math.max(...m.map((e) => e.x + e.width)), y1 = Math.max(...m.map((e) => e.y + e.height))
+    gstate.set(g.id, { s: animAt(g.anim, f, t), px: (x0 + x1) / 2, py: (y0 + y1) / 2 })
+  }
   for (const el of f.elements) {
     if (el.visible === false) continue
     const w = el.width, st = t === null ? null : stateAt(el, f, t)
@@ -307,8 +318,14 @@ async function frameSvg(f: AnyFrame, t: number | null = null) {
       }
       default: inner = `<rect width="${w}" height="${h}" rx="${Math.min(el.cornerRadius || 0, w / 2, h / 2)}" fill="${fill}"${stroke}/>`
     }
-    const cx = el.x + w / 2 + (st?.dx || 0), cy = el.y + h / 2 + (st?.dy || 0)
-    const rot = (el.rotation || 0) + (st?.rotation || 0), sc = st?.scale ?? 1, op = (el.opacity ?? 1) * (st?.opacity ?? 1)
+    let cx = el.x + w / 2 + (st?.dx || 0), cy = el.y + h / 2 + (st?.dy || 0)
+    let rot = (el.rotation || 0) + (st?.rotation || 0), sc = st?.scale ?? 1, op = (el.opacity ?? 1) * (st?.opacity ?? 1)
+    const gs = el.groupId ? gstate.get(el.groupId) : undefined
+    if (gs) {
+      const r = (gs.s.rotation * Math.PI) / 180, vx = (cx - gs.px) * gs.s.scale, vy = (cy - gs.py) * gs.s.scale
+      cx = gs.px + vx * Math.cos(r) - vy * Math.sin(r) + gs.s.dx; cy = gs.py + vx * Math.sin(r) + vy * Math.cos(r) + gs.s.dy
+      sc *= gs.s.scale; rot += gs.s.rotation; op *= gs.s.opacity
+    }
     let filter = ''
     if (el.shadow?.enabled) {
       const fid = id(), s = el.shadow
@@ -374,7 +391,8 @@ const CORS = {
 /* ------------------------------------------------------------------ types en helpers */
 type Json = Record<string, unknown>
 interface El { id: string; type: string; name: string; x: number; y: number; width: number; height: number; rotation: number; opacity: number; visible: boolean; locked: boolean; fill: string; stroke: string; strokeWidth: number; cornerRadius: number; shadow: Json; blend: string; anim?: { in: { type: string; delay: number; duration: number }; out: { type: string; delay: number; duration: number }; emph: { type: string; speed: number } }; [k: string]: unknown }
-interface Frame { id: string; name: string; w: number; h: number; platform: string; background: { type: string; color: string; color2: string; angle: number; src?: string }; elements: El[]; duration: number; safeZone?: boolean }
+interface Frame { id: string; name: string; w: number; h: number; platform: string; background: { type: string; color: string; color2: string; angle: number; src?: string }; elements: El[]; duration: number; safeZone?: boolean; groups?: Grp[] }
+interface Grp { id: string; name: string; anim?: El['anim'] }
 interface Doc { version: 1; frames: Frame[]; colors?: string[] }
 interface Ctx { userId: string; agentName: string; agentKey: string }
 
@@ -442,7 +460,7 @@ function textHeight(text: string, width: number, fontSize: number, lineHeight: n
 /* ------------------------------------------------------------------ patches (zelfde formaat als de app) */
 interface FramePatch { id: string; meta?: Json; full?: Frame; upserts?: El[]; deletes?: string[]; order?: string[] }
 interface DocPatch { frameOrder?: string[]; removed?: string[]; frames: FramePatch[] }
-const META = ['name', 'w', 'h', 'platform', 'background', 'duration', 'safeZone'] as const
+const META = ['name', 'w', 'h', 'platform', 'background', 'duration', 'safeZone', 'groups'] as const
 function diffDocs(a: Doc, b: Doc): DocPatch | null {
   const patch: DocPatch = { frames: [] }
   const aMap = new Map(a.frames.map((f) => [f.id, f]))
@@ -455,7 +473,7 @@ function diffDocs(a: Doc, b: Doc): DocPatch | null {
     if (!pf) { patch.frames.push({ id: f.id, full: f }); continue }
     const fp: FramePatch = { id: f.id }
     const meta: Json = {}
-    for (const k of META) if (JSON.stringify(pf[k]) !== JSON.stringify(f[k])) meta[k] = f[k]
+    for (const k of META) if (JSON.stringify(pf[k]) !== JSON.stringify(f[k])) meta[k] = f[k] === undefined ? null : f[k]
     if (Object.keys(meta).length) fp.meta = meta
     const pe = new Map(pf.elements.map((e) => [e.id, JSON.stringify(e)]))
     const ups = f.elements.filter((e) => pe.get(e.id) !== JSON.stringify(e))
@@ -642,6 +660,54 @@ async function iconSvg(id: string): Promise<{ svg: string; multi: boolean }> {
   return { svg, multi: !svg.includes('currentColor') }
 }
 
+
+/* ------------------------------------------------------------------ groepen, uitlijnen en verdelen (zelfde logica als de editor) */
+type Box = { x: number; y: number; w: number; h: number }
+const elBox = (e: El): Box => ({ x: e.x, y: e.y, w: e.width, h: e.height })
+const unionBox = (bs: Box[]): Box => { const x = Math.min(...bs.map((b) => b.x)), y = Math.min(...bs.map((b) => b.y)); return { x, y, w: Math.max(...bs.map((b) => b.x + b.w)) - x, h: Math.max(...bs.map((b) => b.y + b.h)) - y } }
+const membersOf = (f: Frame, gid: string) => f.elements.filter((e) => e.groupId === gid)
+function normalizeGroups(f: Frame) {
+  const count: Record<string, number> = {}
+  for (const e of f.elements) if (e.groupId) count[String(e.groupId)] = (count[String(e.groupId)] || 0) + 1
+  const keep = new Set((f.groups || []).filter((g) => (count[g.id] || 0) >= 2).map((g) => g.id))
+  for (const e of f.elements) if (e.groupId && !keep.has(String(e.groupId))) delete e.groupId
+  const groups = (f.groups || []).filter((g) => keep.has(g.id))
+  if (groups.length) f.groups = groups; else delete f.groups
+}
+function findGroup(doc: Doc, gid: string): { frame: Frame; group: Grp; members: El[] } {
+  for (const frame of doc.frames) { const group = (frame.groups || []).find((g) => g.id === gid); if (group) return { frame, group, members: membersOf(frame, gid) } }
+  throw new Error(`Groep ${gid} bestaat niet. Gebruik get_design: groepen staan per formaat onder groups.`)
+}
+/** ids mogen element- of groep-id's zijn; een groep (of alle leden ervan) telt als één blok. */
+function unitsFor(f: Frame, ids: string[]) {
+  const gIds = new Set(ids.filter((i) => (f.groups || []).some((g) => g.id === i)))
+  const sel = new Set(ids.filter((i) => !gIds.has(i)))
+  for (const g of gIds) for (const m of membersOf(f, g)) sel.add(m.id)
+  const units: { ids: string[]; box: Box }[] = [], seen = new Set<string>()
+  for (const e of f.elements) {
+    if (!sel.has(e.id) || seen.has(e.id)) continue
+    const gid = e.groupId ? String(e.groupId) : ''
+    if (gid && membersOf(f, gid).every((m) => sel.has(m.id))) { const m = membersOf(f, gid); m.forEach((x) => seen.add(x.id)); units.push({ ids: m.map((x) => x.id), box: unionBox(m.map(elBox)) }) }
+    else { seen.add(e.id); units.push({ ids: [e.id], box: elBox(e) }) }
+  }
+  return units
+}
+function frameOfIds(doc: Doc, ids: string[]): Frame {
+  for (const f of doc.frames) if (ids.some((i) => f.elements.some((e) => e.id === i) || (f.groups || []).some((g) => g.id === i))) return f
+  throw new Error('Deze element- of groep-id\'s bestaan niet. Gebruik get_design.')
+}
+const shift = (f: Frame, ids: string[], dx: number, dy: number) => { for (const e of f.elements) if (ids.includes(e.id)) { e.x = r1(e.x + dx); e.y = r1(e.y + dy) } }
+const NO_ANIM = () => ({ in: { type: 'none', delay: 0, duration: 0.6 }, out: { type: 'none', delay: 0, duration: 0.5 }, emph: { type: 'none', speed: 1 } })
+const nm = (v: unknown, d: number) => (typeof v === 'number' && isFinite(v) ? v : d)
+function applyAnimArgs(cur: El['anim'] | undefined, a: Json) {
+  const an = cur ? clone(cur) : NO_ANIM()
+  const i = a.in as Json | undefined, o = a.out as Json | undefined, m = (a.emphasis || a.emph) as Json | undefined
+  if (i) an.in = { type: IN_ANIMS.includes(String(i.type)) ? String(i.type) : an.in.type, delay: nm(i.delay, an.in.delay), duration: nm(i.duration, an.in.duration) }
+  if (o) an.out = { type: IN_ANIMS.includes(String(o.type)) ? String(o.type) : an.out.type, delay: nm(o.delay, an.out.delay), duration: nm(o.duration, an.out.duration) }
+  if (m) an.emph = { type: EMPH_ANIMS.includes(String(m.type)) ? String(m.type) : an.emph.type, speed: nm(m.speed, an.emph.speed) }
+  return an
+}
+
 /* ------------------------------------------------------------------ uitvoer naar de agent */
 function summarize(doc: Doc) {
   return doc.frames.map((f) => ({
@@ -658,8 +724,10 @@ function summarize(doc: Doc) {
       else Object.assign(o, { color: e.fill, cornerRadius: e.cornerRadius })
       const a = e.anim
       if (a && (a.in.type !== 'none' || a.out.type !== 'none' || a.emph.type !== 'none')) o.animation = a
+      if (e.groupId) o.group_id = e.groupId
       return o
     }),
+    ...(f.groups?.length ? { groups: f.groups.map((g) => { const m = membersOf(f, g.id), b = m.length ? unionBox(m.map(elBox)) : { x: 0, y: 0, w: 0, h: 0 }; const an = g.anim; return { group_id: g.id, name: g.name, element_ids: m.map((x) => x.id), x: r1(b.x), y: r1(b.y), width: r1(b.w), height: r1(b.h), ...(an && (an.in.type !== 'none' || an.out.type !== 'none' || an.emph.type !== 'none') ? { animation: an } : {}) } }) } : {}),
   }))
 }
 const ok = (v: unknown) => ({ content: [{ type: 'text', text: typeof v === 'string' ? v : JSON.stringify(v, null, 1) }] })
@@ -848,7 +916,7 @@ const DESIGN = S.str('Id van het ontwerp (uit list_designs of create_design)')
 const FRAME = S.str('Id van het formaat (uit get_design). Laat leeg voor het eerste formaat, of gebruik "all" om het in alle formaten te zetten; waarden gelden dan voor het eerste formaat en schalen mee.')
 const BOX = { x: S.num('Links in px vanaf de linkerrand van het formaat'), y: S.num('Boven in px vanaf de bovenrand'), width: S.num('Breedte in px'), height: S.num('Hoogte in px') }
 
-const PREVIEWABLE = ['set_background', 'add_text', 'add_shape', 'add_image', 'add_icon', 'update_element', 'delete_element', 'arrange_element', 'animate_element', 'add_many', 'update_many', 'duplicate_element', 'align_elements', 'distribute_elements', 'copy_to_all_formats', 'set_image_crop', 'fit_image', 'animation_preset', 'add_format']
+const PREVIEWABLE = ['group_elements', 'ungroup', 'update_group', 'animate_group', 'set_background', 'add_text', 'add_shape', 'add_image', 'add_icon', 'update_element', 'delete_element', 'arrange_element', 'animate_element', 'add_many', 'update_many', 'duplicate_element', 'align_elements', 'distribute_elements', 'copy_to_all_formats', 'set_image_crop', 'fit_image', 'animation_preset', 'add_format']
 const TOOLS: { name: string; description: string; inputSchema: { type: string; properties: Json; required?: string[] } }[] = [
   { name: 'list_formats', description: 'Toont alle beschikbare advertentieformaten (key, naam, breedte, hoogte, platform) en de standaardsets.', inputSchema: { type: 'object', properties: {} } },
   { name: 'list_designs', description: 'Lijst van ontwerpen waar de gebruiker bij kan, nieuwste eerst.', inputSchema: { type: 'object', properties: { search: S.str('Zoekterm in de titel'), scope: { type: 'string', enum: ['mine', 'team', 'all'], description: 'mine = eigen ontwerpen, team = gedeeld, all = alles (standaard)' } } } },
@@ -880,8 +948,12 @@ const TOOLS: { name: string; description: string; inputSchema: { type: string; p
   { name: 'add_many', description: 'Voegt in één keer meerdere elementen toe. Elk item heeft "tool" (add_text, add_shape, add_image of add_icon) plus de argumenten van die tool (zonder design_id). Sneller dan losse aanroepen; je ziet de cursor alles één voor één plaatsen.', inputSchema: { type: 'object', properties: { design_id: DESIGN, items: { type: 'array', items: { type: 'object' } }, preview: S.bool('Daarna een live beeld terugsturen') }, required: ['design_id', 'items'] } },
   { name: 'update_many', description: 'Past meerdere elementen in één keer aan: updates = [{element_id, props}] met dezelfde props als update_element.', inputSchema: { type: 'object', properties: { design_id: DESIGN, updates: { type: 'array', items: { type: 'object', properties: { element_id: { type: 'string' }, props: { type: 'object' } } } }, preview: S.bool('Daarna een live beeld terugsturen') }, required: ['design_id', 'updates'] } },
   { name: 'duplicate_element', description: 'Dupliceert een element, optioneel verschoven of naar een ander formaat (meegeschaald).', inputSchema: { type: 'object', properties: { design_id: DESIGN, element_id: S.str('Element'), dx: S.num('Verschuiving x'), dy: S.num('Verschuiving y'), to_frame_id: S.str('Naar dit formaat kopiëren') }, required: ['design_id', 'element_id'] } },
-  { name: 'align_elements', description: 'Lijnt elementen uit: left, center, right, top, middle, bottom. relative_to frame (het formaat) of selection (de elementen onderling).', inputSchema: { type: 'object', properties: { design_id: DESIGN, element_ids: { type: 'array', items: { type: 'string' } }, align: { type: 'string', enum: ['left', 'center', 'right', 'top', 'middle', 'bottom'] }, relative_to: { type: 'string', enum: ['frame', 'selection'] }, margin: S.num('Marge tot de rand bij relative_to frame') }, required: ['design_id', 'element_ids', 'align'] } },
-  { name: 'distribute_elements', description: 'Verdeelt elementen met gelijke tussenruimte, horizontaal of verticaal.', inputSchema: { type: 'object', properties: { design_id: DESIGN, element_ids: { type: 'array', items: { type: 'string' } }, axis: { type: 'string', enum: ['horizontal', 'vertical'] } }, required: ['design_id', 'element_ids', 'axis'] } },
+  { name: 'align_elements', description: 'Lijnt elementen en groepen uit: left, center, right, top, middle, bottom. ids mogen element-id\'s en group_id\'s zijn; een groep telt als één blok en blijft intact. relative_to: selection (onderling, standaard bij 2 of meer blokken) of frame (op het formaat, standaard bij 1 blok; met margin).', inputSchema: { type: 'object', properties: { design_id: DESIGN, element_ids: { type: 'array', items: { type: 'string' }, description: 'Element- en/of groep-id\'s' }, align: { type: 'string', enum: ['left', 'center', 'right', 'top', 'middle', 'bottom'] }, relative_to: { type: 'string', enum: ['frame', 'selection'] }, margin: S.num('Marge tot de rand bij relative_to frame') }, required: ['design_id', 'element_ids', 'align'] } },
+  { name: 'distribute_elements', description: 'Verdeelt elementen en groepen (een groep = één blok) horizontaal of verticaal. Zonder spacing: gelijke tussenruimte tussen eerste en laatste (minstens 3 blokken). Met spacing: vaste ruimte in px vanaf het eerste blok (minstens 2).', inputSchema: { type: 'object', properties: { design_id: DESIGN, element_ids: { type: 'array', items: { type: 'string' } }, axis: { type: 'string', enum: ['horizontal', 'vertical'] }, spacing: S.num('Vaste tussenruimte in px (optioneel)') }, required: ['design_id', 'element_ids', 'axis'] } },
+  { name: 'group_elements', description: 'Groepeert elementen (minstens 2, in hetzelfde formaat) tot één groep, bijvoorbeeld knopvlak + knoptekst, of logo + pay-off. Een groep beweegt, schaalt en animeert samen; in de editor selecteer je hem met één klik. De leden komen direct op elkaar te liggen in de laagvolgorde. Bestaande groepen in de selectie worden samengevoegd. Geeft group_id terug.', inputSchema: { type: 'object', properties: { design_id: DESIGN, element_ids: { type: 'array', items: { type: 'string' } }, name: S.str('Naam, bijv. "Knop" of "Logo met pay-off"') }, required: ['design_id', 'element_ids'] } },
+  { name: 'ungroup', description: 'Heft een groep op; de elementen blijven staan. Een groepsanimatie vervalt.', inputSchema: { type: 'object', properties: { design_id: DESIGN, group_id: S.str('Groep') }, required: ['design_id', 'group_id'] } },
+  { name: 'update_group', description: 'Past een groep als geheel aan: naam, positie (x/y = linksboven van de groep, of dx/dy verschuiven), schalen (scale, rond het midden; tekst schaalt mee), zichtbaar, vergrendeld, of laagvolgorde (arrange: front of back).', inputSchema: { type: 'object', properties: { design_id: DESIGN, group_id: S.str('Groep'), name: S.str('Nieuwe naam'), x: S.num('Linkerkant'), y: S.num('Bovenkant'), dx: S.num('Verschuiving x'), dy: S.num('Verschuiving y'), scale: S.num('Schaal, bijv. 1.2'), visible: S.bool('Zichtbaar'), locked: S.bool('Vergrendeld'), arrange: { type: 'string', enum: ['front', 'back'] } }, required: ['design_id', 'group_id'] } },
+  { name: 'animate_group', description: `Animeert een groep als één geheel: alles komt tegelijk binnen en draait/schaalt rond het midden van de groep (ideaal voor een knop met tekst, een logo met pay-off of een prijsbadge). Loopt bovenop eventuele animaties van de onderdelen; zet die met clear_animations uit als ze dubbel zijn. In en uit: ${IN_ANIMS.join(', ')}. Nadruk: ${EMPH_ANIMS.join(', ')}. Type "none" zet uit.`, inputSchema: { type: 'object', properties: { design_id: DESIGN, group_id: S.str('Groep'), in: { type: 'object', properties: { type: { type: 'string', enum: IN_ANIMS }, delay: S.num('Start na (s)'), duration: S.num('Duur (s)') } }, out: { type: 'object', properties: { type: { type: 'string', enum: IN_ANIMS }, delay: S.num('Stopt zoveel s voor het eind'), duration: S.num('Duur (s)') } }, emphasis: { type: 'object', properties: { type: { type: 'string', enum: EMPH_ANIMS }, speed: S.num('Snelheid, 1 = normaal') } } }, required: ['design_id', 'group_id'] } },
   // ---- formaten
   { name: 'copy_to_all_formats', description: 'Zet het ontwerp van één formaat slim om naar alle andere formaten (tekst blijft leesbaar, knoppen schalen mee met hun tekst, stories binnen de veilige zones). Overschrijft de inhoud van die formaten. Controleer daarna elk formaat met get_preview en verfijn per formaat.', inputSchema: { type: 'object', properties: { design_id: DESIGN, from_frame_id: S.str('Bronformaat'), to_frame_ids: { type: 'array', items: { type: 'string' }, description: 'Alleen deze formaten (leeg = alle andere)' } }, required: ['design_id', 'from_frame_id'] } },
   { name: 'delete_format', description: 'Verwijdert een formaat uit het ontwerp.', inputSchema: { type: 'object', properties: { design_id: DESIGN, frame_id: S.str('Formaat') }, required: ['design_id', 'frame_id'] } },
@@ -901,8 +973,8 @@ const TOOLS: { name: string; description: string; inputSchema: { type: string; p
   { name: 'update_asset', description: 'Hernoemt een upload of deelt hem met het team.', inputSchema: { type: 'object', properties: { asset_id: S.str('Upload (uit list_assets)'), name: S.str('Nieuwe naam'), shared: S.bool('Delen met team') }, required: ['asset_id'] } },
   { name: 'delete_asset', description: 'Verwijdert een eigen upload. Alleen op expliciet verzoek; confirm true.', inputSchema: { type: 'object', properties: { asset_id: S.str('Upload'), confirm: S.bool('Moet true zijn') }, required: ['asset_id', 'confirm'] } },
   // ---- animatie
-  { name: 'set_animations', description: 'Zet animaties voor meerdere elementen tegelijk aan, uit of anders. items = [{element_id, in?, out?, emphasis?}] zoals bij animate_element. Gebruik type "none" om een animatie uit te zetten.', inputSchema: { type: 'object', properties: { design_id: DESIGN, items: { type: 'array', items: { type: 'object' } } }, required: ['design_id', 'items'] } },
-  { name: 'clear_animations', description: 'Zet alle animaties uit: van één element (element_id) of van een heel formaat (frame_id, of "all").', inputSchema: { type: 'object', properties: { design_id: DESIGN, element_id: S.str('Element'), frame_id: S.str('Formaat of "all"') }, required: ['design_id'] } },
+  { name: 'set_animations', description: 'Zet animaties voor meerdere elementen en groepen tegelijk aan, uit of anders. items = [{element_id of group_id, in?, out?, emphasis?}] zoals bij animate_element/animate_group. Gebruik type "none" om een animatie uit te zetten.', inputSchema: { type: 'object', properties: { design_id: DESIGN, items: { type: 'array', items: { type: 'object' } } }, required: ['design_id', 'items'] } },
+  { name: 'clear_animations', description: 'Zet animaties uit: van één element (element_id), één groep (group_id; met include_members ook de onderdelen) of van een heel formaat inclusief groepen (frame_id, of "all").', inputSchema: { type: 'object', properties: { design_id: DESIGN, element_id: S.str('Element'), group_id: S.str('Groep'), include_members: S.bool('Bij group_id ook de animaties van de onderdelen uitzetten'), frame_id: S.str('Formaat of "all"') }, required: ['design_id'] } },
   { name: 'animation_preset', description: 'Kant-en-klare animatie voor een heel formaat: stagger_up (alles schuift na elkaar omhoog in, achtergrondvlakken eerst), fade_in (alles vervaagt in), pop_cta (tekst schuift in, de knop ploft en pulseert), ken_burns (foto zoomt langzaam, tekst komt erna), none (alles uit). Houdt rekening met de duur van het formaat.', inputSchema: { type: 'object', properties: { design_id: DESIGN, frame_id: S.str('Formaat of "all"'), preset: { type: 'string', enum: ['stagger_up', 'fade_in', 'pop_cta', 'ken_burns', 'none'] }, duration: S.num('Totale duur van het formaat in seconden (optioneel)') }, required: ['design_id', 'preset'] } },
   { name: 'preview_animation', description: 'Filmstrip van de animatie: beelden op meerdere momenten (standaard 0,3s, 0,8s, 1,5s, halverwege en het einde) zodat je kunt zien of alles goed binnenkomt, niet te druk is en het eindbeeld klopt.', inputSchema: { type: 'object', properties: { design_id: DESIGN, frame_id: S.str('Formaat'), times: { type: 'array', items: { type: 'number' }, description: 'Momenten in seconden' }, size: S.num('Langste zijde per beeld (standaard 600)') }, required: ['design_id', 'frame_id'] } },
 ]
@@ -957,6 +1029,7 @@ async function call(name: string, a: Json, ctx: Ctx) {
             if (n.type === 'text' && typeof n.fontSize === 'number') n.fontSize = Math.max(6, Math.round((n.fontSize as number) * b.k))
             return n
           })
+          if (src.groups?.length) f.groups = clone(src.groups)
         }
         doc.frames.push(f); added = f
       })
@@ -1125,7 +1198,7 @@ async function call(name: string, a: Json, ctx: Ctx) {
       await live.moveTo(el.x + el.width / 2, el.y + el.height / 2, 'verwijderen')
       await live.click([elId])
       await sleep(200)
-      await editDesign(id, ctx, (doc) => { const f = findEl(doc, elId).frame; f.elements = f.elements.filter((e) => e.id !== elId) })
+      await editDesign(id, ctx, (doc) => { const f = findEl(doc, elId).frame; f.elements = f.elements.filter((e) => e.id !== elId); normalizeGroups(f) })
       await live.status('klaar', [])
       return ok({ deleted: elId })
     }
@@ -1275,7 +1348,7 @@ async function call(name: string, a: Json, ctx: Ctx) {
       await editDesign(id, ctx, (doc) => {
         const { el: e, frame: f } = findEl(doc, elId)
         const target = a.to_frame_id ? pickFrames(doc, String(a.to_frame_id))[0] : f
-        const n = clone(e); n.id = uid(); newId = n.id
+        const n = clone(e); n.id = uid(); newId = n.id; delete n.groupId
         if (target.id !== f.id) { const b = mapBox(f, target, e); Object.assign(n, { x: b.x, y: b.y, width: b.width, height: b.height }); if (n.type === 'text') n.fontSize = Math.max(6, Math.round(Number(n.fontSize) * b.k)) }
         n.x += num(a.dx, target.id === f.id ? 24 : 0); n.y += num(a.dy, target.id === f.id ? 24 : 0)
         target.elements.push(n)
@@ -1286,39 +1359,151 @@ async function call(name: string, a: Json, ctx: Ctx) {
 
     case 'align_elements': case 'distribute_elements': {
       const id = String(a.design_id), ids = (a.element_ids || []) as string[]
-      if (!ids.length) throw new Error('Geef element_ids')
+      if (!ids.length) throw new Error('Geef element_ids (element- of groep-id\'s)')
       const row = await loadDesign(id, ctx)
-      const first = findEl(row.data, ids[0])
-      const live = new Live(id, ctx, first.frame.id)
-      await live.moveTo(first.el.x + first.el.width / 2, first.el.y + first.el.height / 2, name === 'align_elements' ? 'uitlijnen' : 'verdelen', ids)
-      await live.click(ids)
+      const f0 = frameOfIds(row.data, ids), units0 = unitsFor(f0, ids)
+      if (!units0.length) throw new Error('Geen van deze id\'s staat in het formaat')
+      const all0 = units0.flatMap((u) => u.ids), b0 = unionBox(units0.map((u) => u.box))
+      const live = new Live(id, ctx, f0.id)
+      await live.moveTo(b0.x + b0.w / 2, b0.y + b0.h / 2, name === 'align_elements' ? 'uitlijnen' : 'verdelen', all0)
+      await live.click(all0)
+      let info = ''
       await editDesign(id, ctx, (doc) => {
-        const els = ids.map((i) => findEl(doc, i).el), f = findEl(doc, ids[0]).frame
+        const f = doc.frames.find((x) => x.id === f0.id)!, units = unitsFor(f, ids)
         if (name === 'align_elements') {
-          const sel = a.relative_to === 'selection' && els.length > 1, m = num(a.margin, 0)
-          const minX = sel ? Math.min(...els.map((e) => e.x)) : m, maxX = sel ? Math.max(...els.map((e) => e.x + e.width)) : f.w - m
-          const minY = sel ? Math.min(...els.map((e) => e.y)) : m, maxY = sel ? Math.max(...els.map((e) => e.y + e.height)) : f.h - m
-          for (const e of els) {
-            if (a.align === 'left') e.x = minX
-            if (a.align === 'right') e.x = maxX - e.width
-            if (a.align === 'center') e.x = (minX + maxX) / 2 - e.width / 2
-            if (a.align === 'top') e.y = minY
-            if (a.align === 'bottom') e.y = maxY - e.height
-            if (a.align === 'middle') e.y = (minY + maxY) / 2 - e.height / 2
+          const rel = a.relative_to === 'frame' || a.relative_to === 'selection' ? String(a.relative_to) : units.length > 1 ? 'selection' : 'frame'
+          const m = num(a.margin, 0)
+          const ref = rel === 'selection' && units.length > 1 ? unionBox(units.map((u) => u.box)) : { x: m, y: m, w: f.w - m * 2, h: f.h - m * 2 }
+          for (const u of units) {
+            const bx = u.box
+            let dx = 0, dy = 0
+            if (a.align === 'left') dx = ref.x - bx.x
+            if (a.align === 'center') dx = ref.x + ref.w / 2 - (bx.x + bx.w / 2)
+            if (a.align === 'right') dx = ref.x + ref.w - (bx.x + bx.w)
+            if (a.align === 'top') dy = ref.y - bx.y
+            if (a.align === 'middle') dy = ref.y + ref.h / 2 - (bx.y + bx.h / 2)
+            if (a.align === 'bottom') dy = ref.y + ref.h - (bx.y + bx.h)
+            shift(f, u.ids, dx, dy)
           }
+          info = `${units.length} ${units.length === 1 ? 'blok' : 'blokken'} uitgelijnd (${a.align}, t.o.v. ${rel === 'frame' ? 'het formaat' : 'elkaar'})`
         } else {
-          const hor = a.axis !== 'vertical'
-          const sorted = [...els].sort((p, q) => (hor ? p.x - q.x : p.y - q.y))
-          const start = hor ? sorted[0].x : sorted[0].y
-          const end = hor ? sorted[sorted.length - 1].x + sorted[sorted.length - 1].width : sorted[sorted.length - 1].y + sorted[sorted.length - 1].height
-          const total = sorted.reduce((s, e) => s + (hor ? e.width : e.height), 0)
-          const gap = (end - start - total) / Math.max(1, sorted.length - 1)
+          const hor = a.axis !== 'vertical', gap = typeof a.spacing === 'number' ? a.spacing : undefined
+          if (units.length < (gap === undefined ? 3 : 2)) throw new Error(gap === undefined ? 'Verdelen met gelijke ruimte vraagt minstens 3 blokken; geef spacing mee voor 2.' : 'Geef minstens 2 blokken')
+          const sorted = [...units].sort((p, q) => (hor ? p.box.x - q.box.x : p.box.y - q.box.y))
+          const start = hor ? sorted[0].box.x : sorted[0].box.y, last = sorted[sorted.length - 1].box
+          const total = sorted.reduce((t, u) => t + (hor ? u.box.w : u.box.h), 0)
+          const space = gap ?? ((hor ? last.x + last.w : last.y + last.h) - start - total) / (sorted.length - 1)
           let pos = start
-          for (const e of sorted) { if (hor) e.x = pos; else e.y = pos; pos += (hor ? e.width : e.height) + gap }
+          for (const u of sorted) { const d = pos - (hor ? u.box.x : u.box.y); shift(f, u.ids, hor ? d : 0, hor ? 0 : d); pos += (hor ? u.box.w : u.box.h) + space }
+          info = `${units.length} blokken verdeeld met ${r1(space)}px tussenruimte`
+        }
+      })
+      await live.status('klaar', all0)
+      return ok(info)
+    }
+
+    /* ---------------- groepen */
+    case 'group_elements': {
+      const id = String(a.design_id), ids = (a.element_ids || []) as string[]
+      if (ids.length < 2) throw new Error('Geef minstens 2 element_ids')
+      const row = await loadDesign(id, ctx)
+      const f0 = frameOfIds(row.data, ids)
+      const els0 = f0.elements.filter((e) => ids.includes(e.id))
+      if (els0.length !== ids.length) throw new Error('Alle elementen moeten in hetzelfde formaat staan')
+      const b0 = unionBox(els0.map(elBox))
+      const live = new Live(id, ctx, f0.id)
+      await live.moveTo(b0.x + b0.w / 2, b0.y + b0.h / 2, 'groeperen', ids)
+      await live.click(ids)
+      const gid = uid()
+      await editDesign(id, ctx, (doc) => {
+        const f = doc.frames.find((x) => x.id === f0.id)!
+        const members = f.elements.filter((e) => ids.includes(e.id))
+        // bestaande groepen samenvoegen: hun andere leden horen er ook bij
+        const old = new Set(members.filter((e) => e.groupId).map((e) => String(e.groupId)))
+        for (const e of f.elements) if (e.groupId && old.has(String(e.groupId)) && !members.includes(e)) members.push(e)
+        const keepAnim = old.size === 1 ? (f.groups || []).find((g) => old.has(g.id))?.anim : undefined
+        f.groups = [...(f.groups || []), { id: gid, name: String(a.name || `Groep ${(f.groups || []).length + 1}`), ...(keepAnim ? { anim: keepAnim } : {}) }]
+        const top = Math.max(...members.map((m) => f.elements.indexOf(m)))
+        const rest = f.elements.filter((e) => !members.includes(e))
+        const at = rest.filter((e) => f.elements.indexOf(e) < top).length
+        members.sort((p, q) => f.elements.indexOf(p) - f.elements.indexOf(q)).forEach((m) => { m.groupId = gid })
+        rest.splice(at, 0, ...members)
+        f.elements = rest
+        normalizeGroups(f)
+      })
+      await live.status('klaar', ids)
+      return ok({ group_id: gid, members: ids, tip: 'Animeer de groep als geheel met animate_group, verplaats hem met update_group of lijn hem uit met align_elements (group_id).' })
+    }
+
+    case 'ungroup': {
+      const id = String(a.design_id), gid = String(a.group_id)
+      const row = await loadDesign(id, ctx)
+      const { frame, members } = findGroup(row.data, gid)
+      const ids = members.map((m) => m.id), b0 = unionBox(members.map(elBox))
+      const live = new Live(id, ctx, frame.id)
+      await live.moveTo(b0.x + b0.w / 2, b0.y + b0.h / 2, 'groep opheffen', ids)
+      await editDesign(id, ctx, (doc) => { const { frame: f } = findGroup(doc, gid); for (const e of f.elements) if (e.groupId === gid) delete e.groupId; normalizeGroups(f) })
+      await live.status('klaar', ids)
+      return ok({ ungrouped: gid, element_ids: ids })
+    }
+
+    case 'update_group': {
+      const id = String(a.design_id), gid = String(a.group_id)
+      const row = await loadDesign(id, ctx)
+      const { frame, members } = findGroup(row.data, gid)
+      const ids = members.map((m) => m.id), b0 = unionBox(members.map(elBox))
+      const live = new Live(id, ctx, frame.id)
+      await live.moveTo(b0.x + b0.w / 2, b0.y + b0.h / 2, 'groep aanpassen', ids)
+      await live.click(ids)
+      const dx = typeof a.x === 'number' ? a.x - b0.x : num(a.dx, 0), dy = typeof a.y === 'number' ? a.y - b0.y : num(a.dy, 0)
+      const sc = typeof a.scale === 'number' && a.scale > 0 ? a.scale : 1
+      if (dx || dy || sc !== 1) {
+        // vloeiend meebewegen in de editor
+        const cx = b0.x + b0.w / 2, cy = b0.y + b0.h / 2
+        const items = members.map((e) => ({ id: e.id, x: cx + (e.x - cx) * sc + dx, y: cy + (e.y - cy) * sc + dy, width: e.width * sc, height: e.height * sc, rotation: e.rotation }))
+        await live.moveTo(cx + dx, cy + dy, 'verplaatsen', ids)
+        await live.send([{ event: 'live', payload: { frameId: frame.id, duration: 0.45, items } }])
+        await sleep(420)
+      }
+      await editDesign(id, ctx, (doc) => {
+        const { frame: f, group } = findGroup(doc, gid)
+        if (typeof a.name === 'string' && a.name.trim()) group.name = a.name.trim()
+        const m = membersOf(f, gid), b = unionBox(m.map(elBox)), cx = b.x + b.w / 2, cy = b.y + b.h / 2
+        for (const e of m) {
+          if (sc !== 1) {
+            e.x = r1(cx + (e.x - cx) * sc); e.y = r1(cy + (e.y - cy) * sc); e.width = r1(e.width * sc); e.height = r1(e.height * sc)
+            if (e.type === 'text') e.fontSize = Math.max(4, r1(Number(e.fontSize || 24) * sc))
+            if (typeof e.cornerRadius === 'number' && e.cornerRadius < 999) e.cornerRadius = r1(e.cornerRadius * sc)
+          }
+          e.x = r1(e.x + dx); e.y = r1(e.y + dy)
+          if (typeof a.visible === 'boolean') e.visible = a.visible
+          if (typeof a.locked === 'boolean') e.locked = a.locked
+        }
+        if (a.arrange === 'front' || a.arrange === 'back') {
+          const rest = f.elements.filter((e) => e.groupId !== gid)
+          f.elements = a.arrange === 'front' ? [...rest, ...m] : [...m, ...rest]
         }
       })
       await live.status('klaar', ids)
-      return ok('Klaar')
+      return ok({ updated: gid })
+    }
+
+    case 'animate_group': {
+      const id = String(a.design_id), gid = String(a.group_id)
+      const row = await loadDesign(id, ctx)
+      const { frame, members } = findGroup(row.data, gid)
+      const ids = members.map((m) => m.id), b0 = unionBox(members.map(elBox))
+      const live = new Live(id, ctx, frame.id)
+      await live.moveTo(b0.x + b0.w / 2, b0.y + b0.h / 2, 'groep animeren', ids)
+      await live.click(ids)
+      let memberAnims = 0
+      await editDesign(id, ctx, (doc) => {
+        const { group, members: m } = findGroup(doc, gid)
+        group.anim = applyAnimArgs(group.anim, a)
+        memberAnims = m.filter((e) => e.anim && (e.anim.in.type !== 'none' || e.anim.out.type !== 'none' || e.anim.emph.type !== 'none')).length
+      })
+      await live.status('klaar', ids)
+      return ok(`Groepsanimatie ingesteld.${memberAnims ? ` Let op: ${memberAnims} onderdelen hebben ook een eigen animatie die erbovenop loopt; zet die uit met clear_animations (group_id + include_members) als het dubbel oogt, en zet daarna de groepsanimatie opnieuw.` : ''} Controleer met preview_animation.`)
     }
 
     /* ---------------- formaten */
@@ -1330,7 +1515,7 @@ async function call(name: string, a: Json, ctx: Ctx) {
       await editDesign(id, ctx, (doc) => {
         const src = pickFrames(doc, from)[0]
         const targets = doc.frames.filter((f) => f.id !== src.id && (!Array.isArray(a.to_frame_ids) || (a.to_frame_ids as string[]).includes(f.id)))
-        for (const t of targets) { t.elements = smartResize(src, t); t.background = clone(src.background); t.duration = src.duration; count++ }
+        for (const t of targets) { t.elements = smartResize(src, t); t.background = clone(src.background); t.duration = src.duration; if (src.groups?.length) t.groups = clone(src.groups); else delete t.groups; count++ }
       })
       return ok({ converted_formats: count, tip: 'Bekijk elk formaat met get_preview; vooral smalle banners (728×90, 320×50) en stories hebben vaak een eigen indeling nodig.' })
     }
@@ -1461,8 +1646,9 @@ async function call(name: string, a: Json, ctx: Ctx) {
     case 'set_animations': {
       const results: unknown[] = []
       for (const it of (Array.isArray(a.items) ? a.items as Json[] : [])) {
-        try { await call('animate_element', { ...it, design_id: a.design_id }, ctx); results.push({ element_id: it.element_id, ok: true }) }
-        catch (e) { results.push({ element_id: it.element_id, error: (e as Error).message }) }
+        const key = it.group_id ? { group_id: it.group_id } : { element_id: it.element_id }
+        try { await call(it.group_id ? 'animate_group' : 'animate_element', { ...it, design_id: a.design_id }, ctx); results.push({ ...key, ok: true }) }
+        catch (e) { results.push({ ...key, error: (e as Error).message }) }
       }
       return ok(results)
     }
@@ -1470,8 +1656,9 @@ async function call(name: string, a: Json, ctx: Ctx) {
       const id = String(a.design_id)
       const none = () => ({ in: { type: 'none', delay: 0, duration: 0.6 }, out: { type: 'none', delay: 0, duration: 0.5 }, emph: { type: 'none', speed: 1 } })
       await editDesign(id, ctx, (doc) => {
-        if (a.element_id) findEl(doc, String(a.element_id)).el.anim = none()
-        else for (const f of pickFrames(doc, String(a.frame_id || 'all'))) f.elements.forEach((e) => { e.anim = none() })
+        if (a.group_id) { const { group, members } = findGroup(doc, String(a.group_id)); delete group.anim; if (a.include_members) members.forEach((e) => { e.anim = none() }) }
+        else if (a.element_id) findEl(doc, String(a.element_id)).el.anim = none()
+        else for (const f of pickFrames(doc, String(a.frame_id || 'all'))) { f.elements.forEach((e) => { e.anim = none() }); (f.groups || []).forEach((g) => { delete g.anim }) }
       })
       return ok('Animaties uitgezet')
     }
@@ -1481,24 +1668,30 @@ async function call(name: string, a: Json, ctx: Ctx) {
         for (const f of pickFrames(doc, String(a.frame_id || 'all'))) {
           if (a.duration) f.duration = Math.max(1, Math.min(30, num(a.duration, f.duration)))
           const els = f.elements.filter((e) => e.visible)
-          const big = (e: El) => e.width * e.height > f.w * f.h * 0.5
           const isCta = (e: El) => e.type === 'rect' && e.cornerRadius > 0 && e.width < f.w * 0.7 && e.height < f.h * 0.25
           const ctaText = (e: El) => e.type === 'text' && els.some((c) => isCta(c) && e.x + e.width / 2 > c.x && e.x + e.width / 2 < c.x + c.width && e.y + e.height / 2 > c.y && e.y + e.height / 2 < c.y + c.height)
+          // een groep krijgt één animatie als geheel; losse elementen elk een eigen
+          const units = unitsFor(f, els.map((e) => e.id)).map((u) => ({ ...u, els: f.elements.filter((e) => u.ids.includes(e.id)) }))
+          const big = (u: { box: Box }) => u.box.w * u.box.h > f.w * f.h * 0.5
+          const cta = (u: { els: El[] }) => u.els.some((e) => isCta(e) || ctaText(e))
           let step = 0
-          const order = [...els].sort((p, q) => (big(q) ? 1 : 0) - (big(p) ? 1 : 0) || p.y - q.y)
-          for (const e of order) {
-            const an = { in: { type: 'none', delay: 0, duration: 0.6 }, out: { type: 'none', delay: 0, duration: 0.5 }, emph: { type: 'none', speed: 1 } }
-            if (preset === 'stagger_up') an.in = big(e) ? { type: 'fade', delay: 0, duration: 0.5 } : { type: 'slideUp', delay: r1(0.15 + step++ * 0.18), duration: 0.6 }
+          const order = [...units].sort((p, q) => (big(q) ? 1 : 0) - (big(p) ? 1 : 0) || p.box.y - q.box.y)
+          for (const u of order) {
+            const an = NO_ANIM()
+            if (preset === 'stagger_up') an.in = big(u) ? { type: 'fade', delay: 0, duration: 0.5 } : { type: 'slideUp', delay: r1(0.15 + step++ * 0.18), duration: 0.6 }
             if (preset === 'fade_in') an.in = { type: 'fade', delay: r1(step++ * 0.12), duration: 0.7 }
             if (preset === 'pop_cta') {
-              if (isCta(e) || ctaText(e)) { an.in = { type: 'pop', delay: 1.2, duration: 0.5 }; an.emph = { type: 'pulse', speed: 1 } }
-              else an.in = big(e) ? { type: 'fade', delay: 0, duration: 0.4 } : { type: 'slideUp', delay: r1(0.1 + step++ * 0.2), duration: 0.6 }
+              if (cta(u)) { an.in = { type: 'pop', delay: 1.2, duration: 0.5 }; an.emph = { type: 'pulse', speed: 1 } }
+              else an.in = big(u) ? { type: 'fade', delay: 0, duration: 0.4 } : { type: 'slideUp', delay: r1(0.1 + step++ * 0.2), duration: 0.6 }
             }
             if (preset === 'ken_burns') {
-              if (e.type === 'image' && big(e)) { an.in = { type: 'zoomOut', delay: 0, duration: Math.max(1, f.duration - 0.2) } }
+              if (u.els.length === 1 && u.els[0].type === 'image' && big(u)) { an.in = { type: 'zoomOut', delay: 0, duration: Math.max(1, f.duration - 0.2) } }
               else an.in = { type: 'fade', delay: r1(0.4 + step++ * 0.2), duration: 0.6 }
             }
-            e.anim = an
+            const gid = u.ids.length > 1 ? String(u.els[0].groupId || '') : ''
+            const g = gid ? (f.groups || []).find((x) => x.id === gid) : undefined
+            if (g) { if (preset === 'none') delete g.anim; else g.anim = an; for (const e of u.els) e.anim = NO_ANIM() }
+            else for (const e of u.els) e.anim = an
           }
         }
       })
@@ -1553,6 +1746,14 @@ FOTO'S (de meest gemaakte fouten)
 - Gebruik een mask (circle, arch) alleen als het onderwerp er ruim in past.
 - Geen tekst over gezichten of het product. Tekst op een foto: zet een vlak of donker verloop eronder of kies een rustig deel van de foto.
 - Vergroot kleine foto's niet sterk op (wazig). Voorkom dat een foto als achtergrond de tekst onleesbaar maakt.
+
+GROEPEREN EN UITLIJNEN
+- Groepeer elementen die bij elkaar horen met group_elements: knopvlak + knoptekst, logo + pay-off, prijsbadge + prijs, icoon + label. Geef de groep een herkenbare naam ("Knop", "Prijsbadge").
+- Een groep beweegt, schaalt en lijnt uit als één blok: gebruik update_group (x/y, dx/dy, scale, arrange) in plaats van elk onderdeel los te verschuiven, zodat de onderlinge afstand klopt.
+- align_elements en distribute_elements accepteren group_id's naast element-id's. Onderling uitlijnen (relative_to selection) bij 2 of meer blokken, op het formaat bij 1 blok. Kolommen of rijen netjes maken: distribute_elements met spacing.
+- Animeer een groep als geheel met animate_group (bijv. de knop: pop met pulse). Zet dan geen losse animaties op de onderdelen, anders bewegen ze dubbel. animation_preset doet dit automatisch: elke groep krijgt één animatie.
+- Wil je één onderdeel apart aanpassen, gebruik dan gewoon update_element op dat element; het blijft in de groep. ungroup heft een groep op.
+- Bij copy_to_all_formats gaan de groepen mee naar de andere formaten (zelfde group_id per formaat). Controleer met get_design per formaat.
 
 SVG'S EN LOGO'S
 - Een svg (logo, illustratie, vorm) plaats je met add_image. Geef een url, een data-URL of de svg-code zelf (beginnend met <svg). Adwerk schoont hem op (xmlns, viewBox, vaste maat, geen scripts) en controleert of hij tekent; krijg je een foutmelding, herstel dan de code en probeer opnieuw.
