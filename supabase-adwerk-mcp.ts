@@ -532,7 +532,7 @@ async function loadDesign(id: string, ctx: Ctx) {
     const { data: m } = await db.from('design_members').select('user_id').eq('design_id', id).eq('user_id', ctx.userId).maybeSingle()
     if (!m) throw new Error('Je hebt geen toegang tot dit ontwerp')
   }
-  return d as { id: string; title: string; data: Doc; updated_at: string; owner_id: string; visibility: string }
+  return d as { id: string; title: string; data: Doc; updated_at: string; owner_id: string; visibility: string; status?: string; thumbnail?: string | null }
 }
 
 /** Wijzigt een ontwerp: lezen, aanpassen, opslaan (met controle op gelijktijdige wijzigingen), live doorsturen. */
@@ -968,6 +968,8 @@ const TOOLS: { name: string; description: string; inputSchema: { type: string; p
   { name: 'duplicate_element', description: 'Dupliceert een element, optioneel verschoven of naar een ander formaat (meegeschaald).', inputSchema: { type: 'object', properties: { design_id: DESIGN, element_id: S.str('Element'), dx: S.num('Verschuiving x'), dy: S.num('Verschuiving y'), to_frame_id: S.str('Naar dit formaat kopiëren') }, required: ['design_id', 'element_id'] } },
   { name: 'align_elements', description: 'Lijnt elementen en groepen uit: left, center, right, top, middle, bottom. ids mogen element-id\'s en group_id\'s zijn; een groep telt als één blok en blijft intact. relative_to: selection (onderling, standaard bij 2 of meer blokken) of frame (op het formaat, standaard bij 1 blok; met margin).', inputSchema: { type: 'object', properties: { design_id: DESIGN, element_ids: { type: 'array', items: { type: 'string' }, description: 'Element- en/of groep-id\'s' }, align: { type: 'string', enum: ['left', 'center', 'right', 'top', 'middle', 'bottom'] }, relative_to: { type: 'string', enum: ['frame', 'selection'] }, margin: S.num('Marge tot de rand bij relative_to frame') }, required: ['design_id', 'element_ids', 'align'] } },
   { name: 'distribute_elements', description: 'Verdeelt elementen en groepen (een groep = één blok) horizontaal of verticaal. Zonder spacing: gelijke tussenruimte tussen eerste en laatste (minstens 3 blokken). Met spacing: vaste ruimte in px vanaf het eerste blok (minstens 2).', inputSchema: { type: 'object', properties: { design_id: DESIGN, element_ids: { type: 'array', items: { type: 'string' } }, axis: { type: 'string', enum: ['horizontal', 'vertical'] }, spacing: S.num('Vaste tussenruimte in px (optioneel)') }, required: ['design_id', 'element_ids', 'axis'] } },
+  { name: 'set_status', description: 'Zet de status van een ontwerp: concept (wordt aan gewerkt), intern (klaar voor interne check), klant (bij de klant), aanpassen (aanpassingen gevraagd), goedgekeurd of live. Gebruik send_to_client om een versie echt naar de klant te sturen.', inputSchema: { type: 'object', properties: { design_id: DESIGN, status: { type: 'string', enum: ['concept', 'intern', 'klant', 'aanpassen', 'goedgekeurd', 'live'] } }, required: ['design_id', 'status'] } },
+  { name: 'send_to_client', description: 'Zet de huidige stand vast als nieuwe versie (v1, v2...), zet de status op "Bij klant" en geeft de feedbacklink terug. De klant ziet in die link alleen deze versie, met advertentievoorbeelden, de brief en knoppen om goed te keuren of aanpassingen te vragen. Doe dit alleen als de gebruiker erom vraagt en het ontwerp klaar is (advertentiecontrole groen).', inputSchema: { type: 'object', properties: { design_id: DESIGN, note: S.str('Wat is er nieuw of veranderd (ziet de klant)') }, required: ['design_id'] } },
   { name: 'set_brief', description: 'Vult de brief (instellingen) van een ontwerp, zichtbaar in de editor onder Brief en voor de klant in de feedbacklink. Standaardvelden: Doelgroep, Budget, Campagnedoelstelling, Landingspagina, Vorm (bijv. Enkele afbeelding, Carrousel, Video, Story of Reel, HTML5-banner, GIF), Koppen (lijst, max ~40 tekens) en Teksten (lijst, ~125 tekens zichtbaar). Elk ander label maakt een nieuw veld. Een array als waarde wordt een lijst. Bestaande velden worden op label gevonden en overschreven; lege string wist. Met internal houd je velden (zoals budget) verborgen voor de klant.', inputSchema: { type: 'object', properties: { design_id: DESIGN, values: { type: 'object', description: 'Label -> tekst of lijst met teksten, bijv. {"Doelgroep": "Remarketing websitebezoekers", "Budget": "€15 per dag", "Koppen": ["...", "..."]}' }, internal: { type: 'array', items: { type: 'string' }, description: 'Labels die alleen intern zichtbaar zijn' }, public: { type: 'array', items: { type: 'string' }, description: 'Labels die weer zichtbaar worden voor de klant' }, remove: { type: 'array', items: { type: 'string' }, description: 'Labels van velden die weg moeten' }, show_client: S.bool('Brief wel of niet tonen in de feedbacklink') }, required: ['design_id'] } },
   { name: 'group_elements', description: 'Groepeert elementen (minstens 2, in hetzelfde formaat) tot één groep, bijvoorbeeld knopvlak + knoptekst, of logo + pay-off. Een groep beweegt, schaalt en animeert samen; in de editor selecteer je hem met één klik. De leden komen direct op elkaar te liggen in de laagvolgorde. Bestaande groepen in de selectie worden samengevoegd. Geeft group_id terug.', inputSchema: { type: 'object', properties: { design_id: DESIGN, element_ids: { type: 'array', items: { type: 'string' } }, name: S.str('Naam, bijv. "Knop" of "Logo met pay-off"') }, required: ['design_id', 'element_ids'] } },
   { name: 'ungroup', description: 'Heft een groep op; de elementen blijven staan. Een groepsanimatie vervalt.', inputSchema: { type: 'object', properties: { design_id: DESIGN, group_id: S.str('Groep') }, required: ['design_id', 'group_id'] } },
@@ -1005,19 +1007,23 @@ async function call(name: string, a: Json, ctx: Ctx) {
     case 'list_formats': return ok({ formats: FORMATS, sets: SETS })
 
     case 'list_designs': {
-      let q = db.from('designs').select('id,title,owner_id,visibility,updated_at').order('updated_at', { ascending: false }).limit(60)
+      let q = db.from('designs').select('id,title,owner_id,visibility,updated_at,status').order('updated_at', { ascending: false }).limit(60)
       if (a.search) q = q.ilike('title', `%${a.search}%`)
       const { data } = await q
       const { data: mem } = await db.from('design_members').select('design_id').eq('user_id', ctx.userId)
       const memSet = new Set((mem || []).map((m: { design_id: string }) => m.design_id))
       const rows = (data || []).filter((d) => d.owner_id === ctx.userId || d.visibility === 'team' || memSet.has(d.id))
         .filter((d) => a.scope === 'mine' ? d.owner_id === ctx.userId : a.scope === 'team' ? d.owner_id !== ctx.userId : true)
-      return ok(rows.map((d) => ({ id: d.id, title: d.title, mine: d.owner_id === ctx.userId, shared_with_team: d.visibility === 'team', updated_at: d.updated_at, url: designUrl(d.id) })))
+      return ok(rows.map((d) => ({ id: d.id, title: d.title, status: d.status, mine: d.owner_id === ctx.userId, shared_with_team: d.visibility === 'team', updated_at: d.updated_at, url: designUrl(d.id) })))
     }
 
     case 'get_design': {
       const d = await loadDesign(String(a.design_id), ctx)
-      return ok({ id: d.id, title: d.title, url: designUrl(d.id), brief: briefOut(d.data), frames: summarize(d.data) })
+      const [{ data: vs }, { data: aps }] = await Promise.all([
+        db.from('design_versions').select('number,note,created_at').eq('design_id', d.id).order('number', { ascending: false }).limit(5),
+        db.from('approvals').select('version,decision,name,note,created_at').eq('design_id', d.id).order('created_at', { ascending: false }).limit(5),
+      ])
+      return ok({ id: d.id, title: d.title, url: designUrl(d.id), status: d.status, versions: vs || [], approvals: aps || [], brief: briefOut(d.data), frames: summarize(d.data) })
     }
 
     case 'create_design': {
@@ -1421,6 +1427,30 @@ async function call(name: string, a: Json, ctx: Ctx) {
       return ok(info)
     }
 
+    case 'set_status': {
+      const d = await loadDesign(String(a.design_id), ctx)
+      const st = String(a.status)
+      if (!['concept', 'intern', 'klant', 'aanpassen', 'goedgekeurd', 'live'].includes(st)) throw new Error('Onbekende status')
+      await db.from('designs').update({ status: st, status_at: new Date().toISOString(), updated_by: ctx.userId }).eq('id', d.id)
+      return ok({ status: st })
+    }
+    case 'send_to_client': {
+      const d = await loadDesign(String(a.design_id), ctx)
+      const { data: last } = await db.from('design_versions').select('number').eq('design_id', d.id).order('number', { ascending: false }).limit(1)
+      const number = ((last || [])[0]?.number || 0) + 1
+      const { error } = await db.from('design_versions').insert({ design_id: d.id, number, note: a.note ? String(a.note).slice(0, 1000) : null, data: d.data, thumbnail: d.thumbnail, created_by: ctx.userId })
+      if (error) throw new Error('Versie opslaan lukt niet')
+      await db.from('designs').update({ status: 'klant', status_at: new Date().toISOString(), updated_by: ctx.userId }).eq('id', d.id)
+      let { data: link } = await db.from('share_links').select('token').eq('design_id', d.id).eq('revoked', false).eq('can_comment', true).order('created_at', { ascending: false }).limit(1).maybeSingle()
+      if (!link) {
+        const abc = 'ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789'
+        const token = [...crypto.getRandomValues(new Uint8Array(32))].map((x) => abc[x % abc.length]).join('')
+        await db.from('share_links').insert({ design_id: d.id, token, label: 'Klant', can_comment: true, created_by: ctx.userId })
+        link = { token }
+      }
+      return ok({ version: number, status: 'klant', feedback_link: `${APP_URL}#/review/${link.token}`, tip: 'Geef de gebruiker deze link om naar de klant te sturen. Goedkeuringen en feedback zie je terug in get_design (approvals) en list_comments als die er is.' })
+    }
+
     case 'set_brief': {
       const id = String(a.design_id)
       const live = new Live(id, ctx, '')
@@ -1792,6 +1822,11 @@ FOTO'S (de meest gemaakte fouten)
 - Gebruik een mask (circle, arch) alleen als het onderwerp er ruim in past.
 - Geen tekst over gezichten of het product. Tekst op een foto: zet een vlak of donker verloop eronder of kies een rustig deel van de foto.
 - Vergroot kleine foto's niet sterk op (wazig). Voorkom dat een foto als achtergrond de tekst onleesbaar maakt.
+
+STATUS EN VERSIES
+- Elk ontwerp heeft een status: concept, intern, klant, aanpassen, goedgekeurd, live (get_design en list_designs tonen hem). Zet hem met set_status als de gebruiker dat vraagt, bijvoorbeeld "zet op interne check".
+- send_to_client zet een versie vast en geeft de feedbacklink. De klant ziet daar advertentievoorbeelden per plaatsing (Facebook, Instagram, Stories, Reels, LinkedIn) met de koppen en teksten uit de brief, en kan goedkeuren of aanpassingen vragen.
+- Staat de status op aanpassen, lees dan de approvals en de opmerkingen, voer ze door en vraag de gebruiker of er een nieuwe versie naar de klant mag.
 
 BRIEF
 - Elk ontwerp heeft een brief (get_design geeft hem terug): doelgroep, budget, campagnedoelstelling, landingspagina, vorm, koppen en teksten. Lees hem vóór je ontwerpt: de vorm bepaalt de opbouw (Carrousel = meerdere kaarten in hetzelfde formaat, Story of Reel = 1080×1920 met veilige zones), de landingspagina en het doel bepalen de boodschap en call to action.
