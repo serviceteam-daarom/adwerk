@@ -532,7 +532,7 @@ async function loadDesign(id: string, ctx: Ctx) {
     const { data: m } = await db.from('design_members').select('user_id').eq('design_id', id).eq('user_id', ctx.userId).maybeSingle()
     if (!m) throw new Error('Je hebt geen toegang tot dit ontwerp')
   }
-  return d as { id: string; title: string; data: Doc; updated_at: string; owner_id: string; visibility: string; status?: string; thumbnail?: string | null }
+  return d as { id: string; title: string; data: Doc; updated_at: string; owner_id: string; visibility: string; status?: string; thumbnail?: string | null; folder_id?: string | null; start_date?: string | null; end_date?: string | null }
 }
 
 /** Wijzigt een ontwerp: lezen, aanpassen, opslaan (met controle op gelijktijdige wijzigingen), live doorsturen. */
@@ -710,6 +710,32 @@ function applyAnimArgs(cur: El['anim'] | undefined, a: Json) {
   return an
 }
 
+
+/* ------------------------------------------------------------------ project (klantbrief, planning) */
+interface ClientCampaign { id: string; name: string; channel: string; goal: string; budget: string; start: string | null; end: string | null; status: string; note: string }
+interface ClientBrief { sections: { id: string; label: string; value: string }[]; campaigns: ClientCampaign[] }
+const CLIENT_SECTIONS = ['Afspraken', 'Doelen', 'Doelgroepen', 'Budget', 'Tone of voice', 'Huisstijl en links', 'Contactpersonen']
+const emptyClientBrief = (): ClientBrief => ({ sections: CLIENT_SECTIONS.map((l) => ({ id: uid(), label: l, value: '' })), campaigns: [] })
+const domainOf = (u?: string | null) => { try { return u ? new URL(/^https?:/.test(u) ? u : 'https://' + u).hostname.replace(/^www\./, '') : null } catch { return null } }
+const faviconOf = (u?: string | null) => { const d = domainOf(u); return d ? `https://www.google.com/s2/favicons?domain=${d}&sz=128` : null }
+const isoDate = (v: unknown) => { if (v === null || v === '') return null; const m = String(v).match(/^(\d{4})-(\d{2})-(\d{2})/); if (!m) throw new Error(`Ongeldige datum "${v}", gebruik JJJJ-MM-DD`); return `${m[1]}-${m[2]}-${m[3]}` }
+type FolderRow = { id: string; name: string; owner_id: string; visibility: string; website?: string | null; color?: string | null; brief?: ClientBrief | null }
+async function loadFolder(id: string, ctx: Ctx) {
+  const { data: f } = await db.from('folders').select('*').eq('id', id).maybeSingle()
+  if (!f || (f.owner_id !== ctx.userId && f.visibility !== 'team')) throw new Error('Project niet gevonden')
+  return f as FolderRow
+}
+function clientBriefOut(f: FolderRow) {
+  const b = f.brief
+  const sections = (b?.sections || []).filter((x) => x.value?.trim()).map((x) => ({ label: x.label, value: x.value }))
+  const campaigns = (b?.campaigns || []).map((c) => ({ id: c.id, name: c.name, channel: c.channel, goal: c.goal, budget: c.budget, start: c.start, end: c.end, status: c.status, note: c.note }))
+  return { project_id: f.id, project: f.name, website: f.website || null, domain: domainOf(f.website), favicon: faviconOf(f.website), color: f.color || null,
+    client_brief: sections.length || campaigns.length ? { sections, campaigns } : { leeg: true, tip: 'Nog geen klantbrief. Vul hem met set_project_brief als de gebruiker afspraken, doelen, doelgroepen, budget of campagnes van de klant noemt.' } }
+}
+async function projectFor(folderId: string | null | undefined, ctx: Ctx) {
+  if (!folderId) return null
+  try { return clientBriefOut(await loadFolder(folderId, ctx)) } catch { return null }
+}
 
 /* ------------------------------------------------------------------ brief (instellingen per ontwerp) */
 const BRIEF_PRESETS = [['doelgroep', 'Doelgroep', 'text'], ['budget', 'Budget', 'text'], ['doel', 'Campagnedoelstelling', 'text'], ['landing', 'Landingspagina', 'url'], ['vorm', 'Vorm', 'text'], ['koppen', 'Koppen', 'list'], ['teksten', 'Teksten', 'list']] as const
@@ -939,7 +965,7 @@ const TOOLS: { name: string; description: string; inputSchema: { type: string; p
   { name: 'list_formats', description: 'Toont alle beschikbare advertentieformaten (key, naam, breedte, hoogte, platform) en de standaardsets.', inputSchema: { type: 'object', properties: {} } },
   { name: 'list_designs', description: 'Lijst van ontwerpen waar de gebruiker bij kan, nieuwste eerst.', inputSchema: { type: 'object', properties: { search: S.str('Zoekterm in de titel'), scope: { type: 'string', enum: ['mine', 'team', 'all'], description: 'mine = eigen ontwerpen, team = gedeeld, all = alles (standaard)' } } } },
   { name: 'get_design', description: 'Volledige inhoud van een ontwerp: formaten met id, afmetingen, achtergrond en alle elementen (id, type, positie, tekst, kleur, animatie). Gebruik dit voordat je iets aanpast. Laag 0 ligt achteraan.', inputSchema: { type: 'object', properties: { design_id: DESIGN }, required: ['design_id'] } },
-  { name: 'create_design', description: 'Maakt een nieuw ontwerp. Geef format-keys (zie list_formats) of een set: social, google, linkedin, demandgen. Geeft de id en de link terug; vraag de gebruiker de link te openen om live mee te kijken.', inputSchema: { type: 'object', properties: { title: S.str('Naam van het ontwerp'), set: { type: 'string', enum: Object.keys(SETS) }, formats: { type: 'array', items: { type: 'string' }, description: 'Format-keys zoals meta-sq, meta-story, g-300x250' }, custom: { type: 'array', items: { type: 'object', properties: { name: S.str('Naam'), width: S.num('Breedte px'), height: S.num('Hoogte px'), platform: S.str('Platform') }, required: ['width', 'height'] }, description: 'Eigen formaten' }, share_with_team: S.bool('Direct delen met het hele team (standaard nee)') }, required: ['title'] } },
+  { name: 'create_design', description: 'Maakt een nieuw ontwerp. Geef format-keys (zie list_formats) of een set: social, google, linkedin, demandgen. Geeft de id en de link terug; vraag de gebruiker de link te openen om live mee te kijken.', inputSchema: { type: 'object', properties: { title: S.str('Naam van het ontwerp'), set: { type: 'string', enum: Object.keys(SETS) }, formats: { type: 'array', items: { type: 'string' }, description: 'Format-keys zoals meta-sq, meta-story, g-300x250' }, custom: { type: 'array', items: { type: 'object', properties: { name: S.str('Naam'), width: S.num('Breedte px'), height: S.num('Hoogte px'), platform: S.str('Platform') }, required: ['width', 'height'] }, description: 'Eigen formaten' }, share_with_team: S.bool('Direct delen met het hele team (standaard: zoals het project, anders privé)'), project_id: S.str('Direct in dit project zetten (list_projects)'), start_date: S.str('Begindatum JJJJ-MM-DD (planning)'), end_date: S.str('Einddatum JJJJ-MM-DD (planning)') }, required: ['title'] } },
   { name: 'add_format', description: 'Voegt een formaat toe aan een ontwerp. Met copy_from_frame_id wordt de inhoud van dat formaat slim meegeschaald.', inputSchema: { type: 'object', properties: { design_id: DESIGN, format: S.str('Format-key (list_formats)'), width: S.num('Eigen breedte'), height: S.num('Eigen hoogte'), name: S.str('Naam bij eigen formaat'), copy_from_frame_id: S.str('Inhoud kopiëren van dit formaat') }, required: ['design_id'] } },
   { name: 'set_frame', description: 'Past instellingen van een formaat aan: naam, animatieduur (seconden, max 30 voor Google Ads) en veilige zones.', inputSchema: { type: 'object', properties: { design_id: DESIGN, frame_id: FRAME, name: S.str('Naam'), duration: S.num('Duur van de animatie in seconden'), safe_zone: S.bool('Veilige zones voor stories tonen') }, required: ['design_id'] } },
   { name: 'set_background', description: 'Achtergrond van een of alle formaten: effen kleur, kleurverloop of foto (URL wordt opgeslagen in Adwerk).', inputSchema: { type: 'object', properties: { design_id: DESIGN, frame_id: FRAME, type: { type: 'string', enum: ['solid', 'gradient', 'image'] }, color: S.str('Hex-kleur, bijv. #1B213B'), color2: S.str('Tweede kleur bij verloop'), angle: S.num('Hoek van het verloop in graden'), image_url: S.str('Foto-URL of data-URL bij type image') }, required: ['design_id'] } },
@@ -985,9 +1011,13 @@ const TOOLS: { name: string; description: string; inputSchema: { type: string; p
   { name: 'share_design', description: 'Deelt een ontwerp met het hele team of maakt het weer privé; of voegt specifieke collega\'s toe (e-mailadressen).', inputSchema: { type: 'object', properties: { design_id: DESIGN, with_team: S.bool('true = hele team, false = privé'), add_emails: { type: 'array', items: { type: 'string' } }, remove_emails: { type: 'array', items: { type: 'string' } } }, required: ['design_id'] } },
   { name: 'set_template', description: 'Maakt van een ontwerp een teamtemplate (of haalt die status weg).', inputSchema: { type: 'object', properties: { design_id: DESIGN, is_template: S.bool('true of false') }, required: ['design_id', 'is_template'] } },
   { name: 'delete_design', description: 'Verwijdert een eigen ontwerp definitief. Alleen doen als de gebruiker daar expliciet om vraagt; zet confirm op true.', inputSchema: { type: 'object', properties: { design_id: DESIGN, confirm: S.bool('Moet true zijn') }, required: ['design_id', 'confirm'] } },
-  { name: 'list_projects', description: 'Projecten (mappen per klant) met het aantal ontwerpen.', inputSchema: { type: 'object', properties: {} } },
-  { name: 'create_project', description: 'Maakt een project (map), bijvoorbeeld per klant.', inputSchema: { type: 'object', properties: { name: S.str('Naam, bijv. klantnaam'), share_with_team: S.bool('Zichtbaar voor het team (standaard ja)') }, required: ['name'] } },
-  { name: 'update_project', description: 'Hernoemt een project of verandert de zichtbaarheid.', inputSchema: { type: 'object', properties: { project_id: S.str('Project'), name: S.str('Nieuwe naam'), share_with_team: S.bool('Zichtbaar voor het team') }, required: ['project_id'] } },
+  { name: 'list_projects', description: 'Projecten (mappen per klant) met het aantal ontwerpen, website en of er een klantbrief is.', inputSchema: { type: 'object', properties: {} } },
+  { name: 'get_brief', description: 'Alles wat je moet weten voordat je ontwerpt: de brief van het ontwerp (doelgroep, budget, doel, landingspagina, vorm, koppen, teksten), de planning en de klantbrief van het project (afspraken, doelen, doelgroepen, budget, tone of voice, huisstijl, campagnes) met website en favicon. Roep dit ALTIJD aan voor je begint te ontwerpen.', inputSchema: { type: 'object', properties: { design_id: DESIGN }, required: ['design_id'] } },
+  { name: 'set_planning', description: 'Zet de begin- en einddatum van een ontwerp (zichtbaar in de kalender en tijdlijn van het project). Lege string of null wist.', inputSchema: { type: 'object', properties: { design_id: DESIGN, start_date: S.str('JJJJ-MM-DD'), end_date: S.str('JJJJ-MM-DD (standaard gelijk aan begin)') }, required: ['design_id'] } },
+  { name: 'get_project_brief', description: 'De klantbrief van een project: afspraken, doelen, doelgroepen, budget, tone of voice, huisstijl en links, contactpersonen en campagnes met kanaal, doel, budget en looptijd. Plus website en favicon.', inputSchema: { type: 'object', properties: { project_id: S.str('Project (list_projects)') }, required: ['project_id'] } },
+  { name: 'set_project_brief', description: 'Vult de klantbrief van een project. sections: label -> tekst (bestaande secties worden op label overschreven, nieuwe labels worden toegevoegd, lege string wist de tekst). campaigns: toevoegen of bijwerken (met id), velden name, channel (Meta Ads, LinkedIn Ads, Google Display, Demand Gen, Organisch...), goal, budget (bijv. "€15 per dag"), start en end (JJJJ-MM-DD), status (Idee, Gepland, Loopt, Afgerond, Gepauzeerd), note. remove_campaigns: id\'s. Ook website en color van het project.', inputSchema: { type: 'object', properties: { project_id: S.str('Project'), sections: { type: 'object', description: 'Bijv. {"Doelen": "Meer aanvragen voor de showroom", "Tone of voice": "Je-vorm, nuchter"}' }, campaigns: { type: 'array', items: { type: 'object', properties: { id: S.str('Bestaande campagne bijwerken'), name: S.str('Naam'), channel: S.str('Kanaal'), goal: S.str('Doel'), budget: S.str('Budget, bijv. €500 per maand'), start: S.str('JJJJ-MM-DD'), end: S.str('JJJJ-MM-DD'), status: S.str('Status'), note: S.str('Notitie') } } }, remove_campaigns: { type: 'array', items: { type: 'string' } }, website: S.str('Website van de klant'), color: S.str('Projectkleur hex') }, required: ['project_id'] } },
+  { name: 'create_project', description: 'Maakt een project (map), bijvoorbeeld per klant. Privé (alleen jij) of gedeeld met het team.', inputSchema: { type: 'object', properties: { name: S.str('Naam, bijv. klantnaam'), share_with_team: S.bool('Zichtbaar voor het team (standaard ja)'), website: S.str('Website van de klant') }, required: ['name'] } },
+  { name: 'update_project', description: 'Hernoemt een project, verandert de zichtbaarheid (privé of team), website of kleur.', inputSchema: { type: 'object', properties: { project_id: S.str('Project'), name: S.str('Nieuwe naam'), share_with_team: S.bool('Zichtbaar voor het team'), website: S.str('Website van de klant'), color: S.str('Kleur hex') }, required: ['project_id'] } },
   { name: 'delete_project', description: 'Verwijdert een eigen project. De ontwerpen erin blijven bestaan (zonder project). Alleen op expliciet verzoek; confirm true.', inputSchema: { type: 'object', properties: { project_id: S.str('Project'), confirm: S.bool('Moet true zijn') }, required: ['project_id', 'confirm'] } },
   { name: 'move_design', description: 'Verplaatst een ontwerp naar een project, of uit een project (project_id leeg).', inputSchema: { type: 'object', properties: { design_id: DESIGN, project_id: S.str('Doelproject; leeg = geen project') }, required: ['design_id'] } },
   // ---- uploads
@@ -1023,7 +1053,8 @@ async function call(name: string, a: Json, ctx: Ctx) {
         db.from('design_versions').select('number,note,created_at').eq('design_id', d.id).order('number', { ascending: false }).limit(5),
         db.from('approvals').select('version,decision,name,note,created_at').eq('design_id', d.id).order('created_at', { ascending: false }).limit(5),
       ])
-      return ok({ id: d.id, title: d.title, url: designUrl(d.id), status: d.status, versions: vs || [], approvals: aps || [], brief: briefOut(d.data), frames: summarize(d.data) })
+      const project = await projectFor(d.folder_id, ctx)
+      return ok({ id: d.id, title: d.title, url: designUrl(d.id), status: d.status, planning: { start_date: d.start_date || null, end_date: d.end_date || null }, versions: vs || [], approvals: aps || [], brief: briefOut(d.data), project, frames: summarize(d.data) })
     }
 
     case 'create_design': {
@@ -1031,7 +1062,10 @@ async function call(name: string, a: Json, ctx: Ctx) {
       const frames: Frame[] = keys.map((k) => FORMATS.find((f) => f.key === k)).filter(Boolean).map((f) => makeFrame(f!))
       for (const c of (Array.isArray(a.custom) ? a.custom as Json[] : [])) frames.push(makeFrame({ name: String(c.name || 'Eigen formaat'), w: Math.round(num(c.width, 1080)), h: Math.round(num(c.height, 1080)), platform: String(c.platform || 'Overig') }))
       if (!frames.length) frames.push(makeFrame(FORMATS[0]))
-      const { data, error } = await db.from('designs').insert({ title: String(a.title || 'Nieuw ontwerp'), data: { version: 1, frames }, owner_id: ctx.userId, updated_by: ctx.userId, visibility: a.share_with_team ? 'team' : 'private' }).select('id').single()
+      let folder: FolderRow | null = null
+      if (a.project_id) folder = await loadFolder(String(a.project_id), ctx)
+      const start = a.start_date !== undefined ? isoDate(a.start_date) : null, end = a.end_date !== undefined ? isoDate(a.end_date) : start
+      const { data, error } = await db.from('designs').insert({ title: String(a.title || 'Nieuw ontwerp'), data: { version: 1, frames }, owner_id: ctx.userId, updated_by: ctx.userId, visibility: a.share_with_team !== undefined ? (a.share_with_team ? 'team' : 'private') : folder ? folder.visibility : 'private', folder_id: folder?.id || null, start_date: start, end_date: end && start && end < start ? start : end }).select('id').single()
       if (error) throw new Error('Ontwerp aanmaken mislukt')
       return ok({ id: data.id, url: designUrl(data.id), frames: frames.map((f) => ({ frame_id: f.id, name: f.name, width: f.w, height: f.h })), tip: 'Vraag de gebruiker de url te openen: dan zie je elkaar live werken.' })
     }
@@ -1660,18 +1694,64 @@ async function call(name: string, a: Json, ctx: Ctx) {
       await db.from('designs').delete().eq('id', d.id)
       return ok('Ontwerp verwijderd')
     }
+    case 'get_brief': {
+      const d = await loadDesign(String(a.design_id), ctx)
+      const project = await projectFor(d.folder_id, ctx)
+      const brief = briefOut(d.data)
+      return ok({ design: { id: d.id, title: d.title, url: designUrl(d.id), status: d.status }, planning: { start_date: d.start_date || null, end_date: d.end_date || null }, brief, project,
+        gebruik: 'Vorm bepaalt de opbouw en formaten; doel en landingspagina bepalen boodschap en call to action; doelgroep en tone of voice bepalen beeld en woordkeuze; koppen en teksten uit de brief letterlijk gebruiken. Huisstijl alleen uit list_brand_kits of de website van de klant. Ontbreekt er iets belangrijks, vraag het de gebruiker of vul het met set_brief na overleg.' })
+    }
+    case 'set_planning': {
+      const d = await loadDesign(String(a.design_id), ctx)
+      const start = a.start_date !== undefined ? isoDate(a.start_date) : (d.start_date || null)
+      let end = a.end_date !== undefined ? isoDate(a.end_date) : (a.start_date !== undefined ? start : (d.end_date || null))
+      if (start && !end) end = start
+      if (start && end && end < start) end = start
+      await db.from('designs').update({ start_date: start, end_date: end }).eq('id', d.id)
+      return ok({ start_date: start, end_date: end })
+    }
+    case 'get_project_brief': {
+      return ok(clientBriefOut(await loadFolder(String(a.project_id), ctx)))
+    }
+    case 'set_project_brief': {
+      const f = await loadFolder(String(a.project_id), ctx)
+      const b: ClientBrief = f.brief && Array.isArray(f.brief.sections) ? clone(f.brief) : emptyClientBrief()
+      if (!Array.isArray(b.campaigns)) b.campaigns = []
+      for (const [label, v] of Object.entries((a.sections || {}) as Json)) {
+        const sec = b.sections.find((x) => x.label.toLowerCase() === label.trim().toLowerCase())
+        const val = Array.isArray(v) ? (v as unknown[]).map(String).join('\n') : String(v ?? '')
+        if (sec) sec.value = val; else b.sections.push({ id: uid(), label: label.trim(), value: val })
+      }
+      for (const c of (Array.isArray(a.campaigns) ? a.campaigns as Json[] : [])) {
+        let cur = c.id ? b.campaigns.find((x) => x.id === String(c.id)) : undefined
+        if (!cur) { cur = { id: uid(), name: '', channel: '', goal: '', budget: '', start: null, end: null, status: 'Idee', note: '' }; b.campaigns.push(cur) }
+        for (const k of ['name', 'channel', 'goal', 'budget', 'status', 'note'] as const) if (c[k] !== undefined) cur[k] = String(c[k] ?? '')
+        if (c.start !== undefined) cur.start = isoDate(c.start)
+        if (c.end !== undefined) cur.end = isoDate(c.end)
+        if (cur.start && cur.end && cur.end < cur.start) cur.end = cur.start
+      }
+      const rm = new Set(((a.remove_campaigns || []) as string[]).map(String))
+      b.campaigns = b.campaigns.filter((x) => !rm.has(x.id))
+      const patch: Json = { brief: b, updated_at: new Date().toISOString() }
+      if (a.website !== undefined) patch.website = String(a.website || '') || null
+      if (a.color) patch.color = String(a.color)
+      const { error } = await db.from('folders').update(patch).eq('id', f.id)
+      if (error) throw new Error('Klantbrief opslaan mislukt')
+      return ok(clientBriefOut({ ...f, ...patch, brief: b } as FolderRow))
+    }
     case 'list_projects': {
-      const { data } = await db.from('folders').select('id,name,owner_id,visibility').order('name')
+      const { data } = await db.from('folders').select('id,name,owner_id,visibility,website,brief').order('name')
       const rows = (data || []).filter((f: { owner_id: string; visibility: string }) => f.owner_id === ctx.userId || f.visibility === 'team')
       const out = []
-      for (const f of rows as { id: string; name: string; owner_id: string; visibility: string }[]) {
+      for (const f of rows as FolderRow[]) {
         const { count } = await db.from('designs').select('id', { count: 'exact', head: true }).eq('folder_id', f.id)
-        out.push({ id: f.id, name: f.name, mine: f.owner_id === ctx.userId, shared_with_team: f.visibility === 'team', designs: count || 0 })
+        const hasBrief = !!(f.brief && ((f.brief.sections || []).some((x) => x.value?.trim()) || (f.brief.campaigns || []).length))
+        out.push({ id: f.id, name: f.name, mine: f.owner_id === ctx.userId, shared_with_team: f.visibility === 'team', website: f.website || null, client_brief: hasBrief, designs: count || 0 })
       }
       return ok(out)
     }
     case 'create_project': {
-      const { data, error } = await db.from('folders').insert({ name: String(a.name), owner_id: ctx.userId, visibility: a.share_with_team === false ? 'private' : 'team' }).select('id,name').single()
+      const { data, error } = await db.from('folders').insert({ name: String(a.name), owner_id: ctx.userId, visibility: a.share_with_team === false ? 'private' : 'team', ...(a.website ? { website: String(a.website) } : {}) }).select('id,name').single()
       if (error) throw new Error('Project aanmaken mislukt')
       return ok(data)
     }
@@ -1680,6 +1760,8 @@ async function call(name: string, a: Json, ctx: Ctx) {
       if (!f || (f.owner_id !== ctx.userId && f.visibility !== 'team')) throw new Error('Project niet gevonden')
       const patch: Json = {}
       if (a.name) patch.name = String(a.name)
+      if (a.website !== undefined) patch.website = String(a.website || '') || null
+      if (a.color) patch.color = String(a.color)
       if (a.share_with_team !== undefined) { if (f.owner_id !== ctx.userId) throw new Error('Alleen de eigenaar kan de zichtbaarheid aanpassen'); patch.visibility = a.share_with_team ? 'team' : 'private' }
       await db.from('folders').update(patch).eq('id', f.id)
       return ok('Project bijgewerkt')
@@ -1807,7 +1889,7 @@ const INSTRUCTIONS = `Adwerk is de ontwerptool van daar-om.nl voor social ads, H
 
 WERKWIJZE
 1. Begrijp de opdracht: klant, doel (bereik, klikken, leads), doelgroep, kanaal en formaten. Haal de huisstijl op met list_brand_kits.
-2. list_designs of create_design (een set: social, google, linkedin, demandgen). Zet het ontwerp in het project van de klant (list_projects, create_project, move_design).
+2. list_designs of create_design (een set: social, google, linkedin, demandgen). Zet het ontwerp in het project van de klant (create_design met project_id, of move_design). Projecten en ontwerpen zijn privé of gedeeld met het team. Lees daarna get_brief.
 3. Ontwerp eerst één hoofdformaat (meestal 1080×1080). Gebruik add_many om in één keer op te bouwen.
 4. Kijk ALTIJD met get_preview (of preview: true bij een tool) en los alles op wat de controle meldt én wat je zelf ziet. Herhaal tot het echt goed is. Stop nooit zonder een laatste get_preview van elk formaat.
 5. Zet daarna om met copy_to_all_formats en controleer en verfijn elk formaat apart: een 728×90 of 320×50 heeft een eigen indeling nodig (logo links, korte kop midden, knop rechts), een story houdt boven 14% en onder 20% vrij.
@@ -1829,6 +1911,10 @@ STATUS EN VERSIES
 - Staat de status op aanpassen, lees dan de approvals en de opmerkingen, voer ze door en vraag de gebruiker of er een nieuwe versie naar de klant mag.
 
 BRIEF
+- Begin ALTIJD met get_brief: dat geeft de brief van het ontwerp, de planning en de klantbrief van het project (afspraken, doelen, doelgroepen, budget, tone of voice, campagnes) met de website. Laat alles wat daar staat terugkomen in je ontwerp en teksten; verzin niets wat ermee in strijd is.
+- Hoort het ontwerp bij een campagne uit de klantbrief, neem dan het doel, de doelgroep en het kanaal van die campagne over en zet de planning (set_planning) op de looptijd van de campagne als die nog leeg is.
+- Budget schrijf je als bedrag plus periode: "€15 per dag", "€500 per maand", "€2.000 looptijd totaal".
+- Noemt de gebruiker afspraken of campagnes van de klant, leg ze vast met set_project_brief. De website van het project geeft ook de favicon die in de advertentievoorbeelden als profielfoto staat.
 - Elk ontwerp heeft een brief (get_design geeft hem terug): doelgroep, budget, campagnedoelstelling, landingspagina, vorm, koppen en teksten. Lees hem vóór je ontwerpt: de vorm bepaalt de opbouw (Carrousel = meerdere kaarten in hetzelfde formaat, Story of Reel = 1080×1920 met veilige zones), de landingspagina en het doel bepalen de boodschap en call to action.
 - Noemt de gebruiker zulke instellingen, of schrijf je koppen en teksten, zet ze dan met set_brief in de brief. De klant ziet de brief in de feedbacklink; houd interne zaken zoals budget met internal verborgen als de gebruiker dat wil.
 - Gebruik de koppen en teksten uit de brief letterlijk in het ontwerp als die er staan.
