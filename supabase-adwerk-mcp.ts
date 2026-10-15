@@ -732,6 +732,60 @@ function clientBriefOut(f: FolderRow) {
   return { project_id: f.id, project: f.name, website: f.website || null, domain: domainOf(f.website), favicon: faviconOf(f.website), color: f.color || null,
     client_brief: sections.length || campaigns.length ? { sections, campaigns } : { leeg: true, tip: 'Nog geen klantbrief. Vul hem met set_project_brief als de gebruiker afspraken, doelen, doelgroepen, budget of campagnes van de klant noemt.' } }
 }
+const projectUrl = (id: string) => `${APP_URL}#/folder/${id}`
+const normSite = (v: unknown) => { const w = String(v ?? '').trim(); return w ? (/^https?:\/\//i.test(w) ? w : 'https://' + w) : null }
+const normColor = (v: unknown) => { const c = String(v ?? '').trim(); if (!/^#?[0-9a-f]{6}$/i.test(c)) throw new Error(`Ongeldige kleur "${c}", gebruik een hexcode zoals #1A5FC4`); return (c.startsWith('#') ? c : '#' + c).toUpperCase() }
+const CAMP_STATUS = ['Idee', 'Gepland', 'Loopt', 'Afgerond', 'Gepauzeerd']
+
+/** Past wijzigingen toe op een klantbrief: onderdelen toevoegen, aanvullen, hernoemen, verwijderen en campagnes beheren. */
+function applyClientBrief(b: ClientBrief, a: Json) {
+  if (!Array.isArray(b.sections)) b.sections = []
+  if (!Array.isArray(b.campaigns)) b.campaigns = []
+  const find = (label: string) => b.sections.find((x) => x.label.toLowerCase() === label.trim().toLowerCase())
+  const text = (v: unknown) => Array.isArray(v) ? (v as unknown[]).map(String).join('\n') : String(v ?? '')
+  for (const [from, to] of Object.entries((a.rename_sections || {}) as Json)) { const sec = find(from); if (!sec) throw new Error(`Onderdeel "${from}" bestaat niet`); sec.label = String(to).trim() }
+  for (const [label, v] of Object.entries((a.sections || {}) as Json)) { const sec = find(label); if (sec) sec.value = text(v); else b.sections.push({ id: uid(), label: label.trim(), value: text(v) }) }
+  for (const [label, v] of Object.entries((a.append_sections || {}) as Json)) { const sec = find(label); const add = text(v); if (sec) sec.value = sec.value?.trim() ? `${sec.value.trimEnd()}\n${add}` : add; else b.sections.push({ id: uid(), label: label.trim(), value: add }) }
+  for (const label of (a.add_sections || []) as string[]) if (!find(label)) b.sections.push({ id: uid(), label: String(label).trim(), value: '' })
+  const rmS = new Set(((a.remove_sections || []) as string[]).map((x) => String(x).trim().toLowerCase()))
+  if (rmS.size) b.sections = b.sections.filter((x) => !rmS.has(x.label.toLowerCase()) && !rmS.has(x.id.toLowerCase()))
+  if (Array.isArray(a.section_order)) {
+    const order = (a.section_order as string[]).map((l) => String(l).toLowerCase())
+    b.sections.sort((x, y) => { const i = order.indexOf(x.label.toLowerCase()), j = order.indexOf(y.label.toLowerCase()); return (i < 0 ? 999 : i) - (j < 0 ? 999 : j) })
+  }
+  const changed: string[] = []
+  for (const c of (Array.isArray(a.campaigns) ? a.campaigns as Json[] : [])) {
+    let cur = c.id ? b.campaigns.find((x) => x.id === String(c.id)) : (c.name ? b.campaigns.find((x) => x.name.toLowerCase() === String(c.name).trim().toLowerCase()) : undefined)
+    if (c.id && !cur) throw new Error(`Campagne met id ${c.id} bestaat niet`)
+    if (!cur) { cur = { id: uid(), name: '', channel: '', goal: '', budget: '', start: null, end: null, status: 'Idee', note: '' }; b.campaigns.push(cur) }
+    for (const k of ['name', 'channel', 'goal', 'budget', 'note'] as const) if (c[k] !== undefined) cur[k] = String(c[k] ?? '')
+    if (c.status !== undefined) { const st = CAMP_STATUS.find((x) => x.toLowerCase() === String(c.status).toLowerCase()); if (!st) throw new Error(`Onbekende campagnestatus "${c.status}". Kies uit: ${CAMP_STATUS.join(', ')}`); cur.status = st }
+    if (c.start !== undefined) cur.start = isoDate(c.start)
+    if (c.end !== undefined) cur.end = isoDate(c.end)
+    if (cur.start && cur.end && cur.end < cur.start) cur.end = cur.start
+    changed.push(cur.id)
+  }
+  const rmC = new Set(((a.remove_campaigns || []) as string[]).map((x) => String(x).toLowerCase()))
+  if (rmC.size) b.campaigns = b.campaigns.filter((x) => !rmC.has(x.id.toLowerCase()) && !rmC.has(x.name.toLowerCase()))
+  return changed
+}
+
+/** Volledig project: instellingen, hele klantbrief (ook lege onderdelen, met id's), campagnes en ontwerpen. */
+async function projectFull(f: FolderRow & { owner_id: string; visibility: string }, ctx: Ctx) {
+  const { data: ds } = await db.from('designs').select('id,title,status,start_date,end_date,updated_at,owner_id,visibility').eq('folder_id', f.id).order('updated_at', { ascending: false })
+  const { data: mem } = await db.from('design_members').select('design_id').eq('user_id', ctx.userId)
+  const memSet = new Set((mem || []).map((m: { design_id: string }) => m.design_id))
+  const designs = (ds || []).filter((d: Json) => d.owner_id === ctx.userId || d.visibility === 'team' || memSet.has(String(d.id)))
+    .map((d: Json) => ({ id: d.id, title: d.title, status: d.status, start_date: d.start_date, end_date: d.end_date, url: designUrl(String(d.id)) }))
+  const b = f.brief && Array.isArray(f.brief.sections) ? f.brief : null
+  return {
+    id: f.id, name: f.name, url: projectUrl(f.id), mine: f.owner_id === ctx.userId, visibility: f.visibility === 'team' ? 'team' : 'private',
+    website: f.website || null, domain: domainOf(f.website), favicon: faviconOf(f.website), color: f.color || null,
+    client_brief: { sections: (b?.sections || []).map((x) => ({ id: x.id, label: x.label, value: x.value })), campaigns: (b?.campaigns || []) },
+    designs,
+  }
+}
+
 async function projectFor(folderId: string | null | undefined, ctx: Ctx) {
   if (!folderId) return null
   try { return clientBriefOut(await loadFolder(folderId, ctx)) } catch { return null }
@@ -1014,10 +1068,11 @@ const TOOLS: { name: string; description: string; inputSchema: { type: string; p
   { name: 'list_projects', description: 'Projecten (mappen per klant) met het aantal ontwerpen, website en of er een klantbrief is.', inputSchema: { type: 'object', properties: {} } },
   { name: 'get_brief', description: 'Alles wat je moet weten voordat je ontwerpt: de brief van het ontwerp (doelgroep, budget, doel, landingspagina, vorm, koppen, teksten), de planning en de klantbrief van het project (afspraken, doelen, doelgroepen, budget, tone of voice, huisstijl, campagnes) met website en favicon. Roep dit ALTIJD aan voor je begint te ontwerpen.', inputSchema: { type: 'object', properties: { design_id: DESIGN }, required: ['design_id'] } },
   { name: 'set_planning', description: 'Zet de begin- en einddatum van een ontwerp (zichtbaar in de kalender en tijdlijn van het project). Lege string of null wist.', inputSchema: { type: 'object', properties: { design_id: DESIGN, start_date: S.str('JJJJ-MM-DD'), end_date: S.str('JJJJ-MM-DD (standaard gelijk aan begin)') }, required: ['design_id'] } },
-  { name: 'get_project_brief', description: 'De klantbrief van een project: afspraken, doelen, doelgroepen, budget, tone of voice, huisstijl en links, contactpersonen en campagnes met kanaal, doel, budget en looptijd. Plus website en favicon.', inputSchema: { type: 'object', properties: { project_id: S.str('Project (list_projects)') }, required: ['project_id'] } },
-  { name: 'set_project_brief', description: 'Vult de klantbrief van een project. sections: label -> tekst (bestaande secties worden op label overschreven, nieuwe labels worden toegevoegd, lege string wist de tekst). campaigns: toevoegen of bijwerken (met id), velden name, channel (Meta Ads, LinkedIn Ads, Google Display, Demand Gen, Organisch...), goal, budget (bijv. "€15 per dag"), start en end (JJJJ-MM-DD), status (Idee, Gepland, Loopt, Afgerond, Gepauzeerd), note. remove_campaigns: id\'s. Ook website en color van het project.', inputSchema: { type: 'object', properties: { project_id: S.str('Project'), sections: { type: 'object', description: 'Bijv. {"Doelen": "Meer aanvragen voor de showroom", "Tone of voice": "Je-vorm, nuchter"}' }, campaigns: { type: 'array', items: { type: 'object', properties: { id: S.str('Bestaande campagne bijwerken'), name: S.str('Naam'), channel: S.str('Kanaal'), goal: S.str('Doel'), budget: S.str('Budget, bijv. €500 per maand'), start: S.str('JJJJ-MM-DD'), end: S.str('JJJJ-MM-DD'), status: S.str('Status'), note: S.str('Notitie') } } }, remove_campaigns: { type: 'array', items: { type: 'string' } }, website: S.str('Website van de klant'), color: S.str('Projectkleur hex') }, required: ['project_id'] } },
-  { name: 'create_project', description: 'Maakt een project (map), bijvoorbeeld per klant. Privé (alleen jij) of gedeeld met het team.', inputSchema: { type: 'object', properties: { name: S.str('Naam, bijv. klantnaam'), share_with_team: S.bool('Zichtbaar voor het team (standaard ja)'), website: S.str('Website van de klant') }, required: ['name'] } },
-  { name: 'update_project', description: 'Hernoemt een project, verandert de zichtbaarheid (privé of team), website of kleur.', inputSchema: { type: 'object', properties: { project_id: S.str('Project'), name: S.str('Nieuwe naam'), share_with_team: S.bool('Zichtbaar voor het team'), website: S.str('Website van de klant'), color: S.str('Kleur hex') }, required: ['project_id'] } },
+  { name: 'get_project', description: 'Alles van een project: naam, url, zichtbaarheid (private of team), website, favicon, kleur, de volledige klantbrief (alle onderdelen met id, ook lege) met campagnes, en de ontwerpen erin met status en planning.', inputSchema: { type: 'object', properties: { project_id: S.str('Project (list_projects)') }, required: ['project_id'] } },
+  { name: 'get_project_brief', description: 'Korte versie van de klantbrief van een project (alleen ingevulde onderdelen en campagnes). Gebruik get_project voor alles.', inputSchema: { type: 'object', properties: { project_id: S.str('Project (list_projects)') }, required: ['project_id'] } },
+  { name: 'set_project_brief', description: 'Leest en schrijft de klantbrief van een project: onderdelen invullen, aanvullen, toevoegen, hernoemen, ordenen en verwijderen, en campagnes aanmaken, bijwerken en verwijderen. Geeft het hele project terug. Ook website en color.', inputSchema: { type: 'object', properties: { project_id: S.str('Project'), sections: { type: 'object', description: 'Onderdeel -> tekst. Bestaand onderdeel (op naam) wordt overschreven, een nieuwe naam voegt een onderdeel toe. Standaard: Afspraken, Doelen, Doelgroepen, Budget, Tone of voice, Huisstijl en links, Contactpersonen. Bijv. {"Doelen": "40 leads per maand", "Concurrenten": "..."}' }, append_sections: { type: 'object', description: 'Onderdeel -> tekst die onder de bestaande tekst wordt toegevoegd' }, add_sections: { type: 'array', items: { type: 'string' }, description: 'Lege onderdelen toevoegen' }, rename_sections: { type: 'object', description: 'Oude naam -> nieuwe naam' }, remove_sections: { type: 'array', items: { type: 'string' }, description: 'Onderdelen verwijderen (naam of id)' }, section_order: { type: 'array', items: { type: 'string' }, description: 'Nieuwe volgorde van onderdelen (namen)' }, campaigns: { type: 'array', description: 'Campagnes aanmaken of bijwerken. Met id (of een bestaande naam) wordt bijgewerkt, anders aangemaakt.', items: { type: 'object', properties: { id: S.str('Bestaande campagne'), name: S.str('Naam'), channel: S.str('Kanaal: Meta Ads, LinkedIn Ads, Google Ads, Google Display, Demand Gen, TikTok, Nieuwsbrief, Organisch social'), goal: S.str('Doel: Websiteverkeer, Leads, Verkoop, Naamsbekendheid, Bereik, Werving'), budget: S.str('Bedrag plus periode, bijv. €15 per dag of €500 per maand'), start: S.str('JJJJ-MM-DD'), end: S.str('JJJJ-MM-DD'), status: { type: 'string', enum: ['Idee', 'Gepland', 'Loopt', 'Afgerond', 'Gepauzeerd'] }, note: S.str('Notitie') } } }, remove_campaigns: { type: 'array', items: { type: 'string' }, description: 'Campagnes verwijderen (id of naam)' }, website: S.str('Website van de klant'), color: S.str('Projectkleur hex') }, required: ['project_id'] } },
+  { name: 'create_project', description: 'Maakt een project (map per klant) met naam, website (de favicon wordt het projecticoon), kleur, zichtbaarheid en direct een klantbrief met onderdelen en campagnes. Geeft het volledige project met url terug.', inputSchema: { type: 'object', properties: { name: S.str('Naam, bijv. klantnaam'), website: S.str('Website van de klant'), color: S.str('Kleur hex, bijv. #13A06B'), visibility: { type: 'string', enum: ['team', 'private'], description: 'team = hele daar-om.nl team (standaard), private = alleen jij' }, client_brief: { type: 'object', description: 'Optioneel, zelfde velden als set_project_brief', properties: { sections: { type: 'object', description: 'Onderdeel -> tekst. Bestaand onderdeel (op naam) wordt overschreven, een nieuwe naam voegt een onderdeel toe. Standaard: Afspraken, Doelen, Doelgroepen, Budget, Tone of voice, Huisstijl en links, Contactpersonen. Bijv. {"Doelen": "40 leads per maand", "Concurrenten": "..."}' }, append_sections: { type: 'object', description: 'Onderdeel -> tekst die onder de bestaande tekst wordt toegevoegd' }, add_sections: { type: 'array', items: { type: 'string' }, description: 'Lege onderdelen toevoegen' }, rename_sections: { type: 'object', description: 'Oude naam -> nieuwe naam' }, remove_sections: { type: 'array', items: { type: 'string' }, description: 'Onderdelen verwijderen (naam of id)' }, section_order: { type: 'array', items: { type: 'string' }, description: 'Nieuwe volgorde van onderdelen (namen)' }, campaigns: { type: 'array', description: 'Campagnes aanmaken of bijwerken. Met id (of een bestaande naam) wordt bijgewerkt, anders aangemaakt.', items: { type: 'object', properties: { id: S.str('Bestaande campagne'), name: S.str('Naam'), channel: S.str('Kanaal: Meta Ads, LinkedIn Ads, Google Ads, Google Display, Demand Gen, TikTok, Nieuwsbrief, Organisch social'), goal: S.str('Doel: Websiteverkeer, Leads, Verkoop, Naamsbekendheid, Bereik, Werving'), budget: S.str('Bedrag plus periode, bijv. €15 per dag of €500 per maand'), start: S.str('JJJJ-MM-DD'), end: S.str('JJJJ-MM-DD'), status: { type: 'string', enum: ['Idee', 'Gepland', 'Loopt', 'Afgerond', 'Gepauzeerd'] }, note: S.str('Notitie') } } }, remove_campaigns: { type: 'array', items: { type: 'string' }, description: 'Campagnes verwijderen (id of naam)' } } } }, required: ['name'] } },
+  { name: 'update_project', description: 'Wijzigt naam, website, kleur of zichtbaarheid (private of team) van een project. Zichtbaarheid kan alleen de maker wijzigen. Geeft het volledige project terug.', inputSchema: { type: 'object', properties: { project_id: S.str('Project'), name: S.str('Nieuwe naam'), website: S.str('Website van de klant (leeg = weghalen)'), color: S.str('Kleur hex'), visibility: { type: 'string', enum: ['team', 'private'] } }, required: ['project_id'] } },
   { name: 'delete_project', description: 'Verwijdert een eigen project. De ontwerpen erin blijven bestaan (zonder project). Alleen op expliciet verzoek; confirm true.', inputSchema: { type: 'object', properties: { project_id: S.str('Project'), confirm: S.bool('Moet true zijn') }, required: ['project_id', 'confirm'] } },
   { name: 'move_design', description: 'Verplaatst een ontwerp naar een project, of uit een project (project_id leeg).', inputSchema: { type: 'object', properties: { design_id: DESIGN, project_id: S.str('Doelproject; leeg = geen project') }, required: ['design_id'] } },
   // ---- uploads
@@ -1713,58 +1768,53 @@ async function call(name: string, a: Json, ctx: Ctx) {
     case 'get_project_brief': {
       return ok(clientBriefOut(await loadFolder(String(a.project_id), ctx)))
     }
+    case 'get_project': {
+      const f = await loadFolder(String(a.project_id), ctx)
+      return ok(await projectFull(f as FolderRow & { owner_id: string; visibility: string }, ctx))
+    }
     case 'set_project_brief': {
       const f = await loadFolder(String(a.project_id), ctx)
       const b: ClientBrief = f.brief && Array.isArray(f.brief.sections) ? clone(f.brief) : emptyClientBrief()
-      if (!Array.isArray(b.campaigns)) b.campaigns = []
-      for (const [label, v] of Object.entries((a.sections || {}) as Json)) {
-        const sec = b.sections.find((x) => x.label.toLowerCase() === label.trim().toLowerCase())
-        const val = Array.isArray(v) ? (v as unknown[]).map(String).join('\n') : String(v ?? '')
-        if (sec) sec.value = val; else b.sections.push({ id: uid(), label: label.trim(), value: val })
-      }
-      for (const c of (Array.isArray(a.campaigns) ? a.campaigns as Json[] : [])) {
-        let cur = c.id ? b.campaigns.find((x) => x.id === String(c.id)) : undefined
-        if (!cur) { cur = { id: uid(), name: '', channel: '', goal: '', budget: '', start: null, end: null, status: 'Idee', note: '' }; b.campaigns.push(cur) }
-        for (const k of ['name', 'channel', 'goal', 'budget', 'status', 'note'] as const) if (c[k] !== undefined) cur[k] = String(c[k] ?? '')
-        if (c.start !== undefined) cur.start = isoDate(c.start)
-        if (c.end !== undefined) cur.end = isoDate(c.end)
-        if (cur.start && cur.end && cur.end < cur.start) cur.end = cur.start
-      }
-      const rm = new Set(((a.remove_campaigns || []) as string[]).map(String))
-      b.campaigns = b.campaigns.filter((x) => !rm.has(x.id))
+      const changed = applyClientBrief(b, a)
       const patch: Json = { brief: b, updated_at: new Date().toISOString() }
-      if (a.website !== undefined) patch.website = String(a.website || '') || null
-      if (a.color) patch.color = String(a.color)
+      if (a.website !== undefined) patch.website = normSite(a.website)
+      if (a.color) patch.color = normColor(a.color)
       const { error } = await db.from('folders').update(patch).eq('id', f.id)
       if (error) throw new Error('Klantbrief opslaan mislukt')
-      return ok(clientBriefOut({ ...f, ...patch, brief: b } as FolderRow))
+      return ok({ ...(await projectFull({ ...f, ...patch, brief: b } as FolderRow & { owner_id: string; visibility: string }, ctx)), changed_campaigns: changed })
     }
     case 'list_projects': {
-      const { data } = await db.from('folders').select('id,name,owner_id,visibility,website,brief').order('name')
+      const { data } = await db.from('folders').select('id,name,owner_id,visibility,website,color,brief').order('name')
       const rows = (data || []).filter((f: { owner_id: string; visibility: string }) => f.owner_id === ctx.userId || f.visibility === 'team')
       const out = []
       for (const f of rows as FolderRow[]) {
         const { count } = await db.from('designs').select('id', { count: 'exact', head: true }).eq('folder_id', f.id)
         const hasBrief = !!(f.brief && ((f.brief.sections || []).some((x) => x.value?.trim()) || (f.brief.campaigns || []).length))
-        out.push({ id: f.id, name: f.name, mine: f.owner_id === ctx.userId, shared_with_team: f.visibility === 'team', website: f.website || null, client_brief: hasBrief, designs: count || 0 })
+        out.push({ id: f.id, name: f.name, url: projectUrl(f.id), mine: f.owner_id === ctx.userId, visibility: f.visibility === 'team' ? 'team' : 'private', website: f.website || null, color: f.color || null, client_brief: hasBrief, campaigns: (f.brief?.campaigns || []).length, designs: count || 0 })
       }
       return ok(out)
     }
     case 'create_project': {
-      const { data, error } = await db.from('folders').insert({ name: String(a.name), owner_id: ctx.userId, visibility: a.share_with_team === false ? 'private' : 'team', ...(a.website ? { website: String(a.website) } : {}) }).select('id,name').single()
-      if (error) throw new Error('Project aanmaken mislukt')
-      return ok(data)
+      const name = String(a.name || '').trim()
+      if (!name) throw new Error('Geef een naam')
+      const vis = a.visibility === 'private' || a.share_with_team === false ? 'private' : 'team'
+      const b = emptyClientBrief()
+      if (a.client_brief && typeof a.client_brief === 'object') applyClientBrief(b, a.client_brief as Json)
+      const { data, error } = await db.from('folders').insert({ name, owner_id: ctx.userId, visibility: vis, website: normSite(a.website), color: a.color ? normColor(a.color) : '#1A5FC4', brief: b }).select('*').single()
+      if (error) throw new Error('Project aanmaken mislukt: ' + error.message)
+      return ok({ ...(await projectFull(data, ctx)), tip: 'Open de url om het project te zien. Zet ontwerpen erin met create_design (project_id) of move_design.' })
     }
     case 'update_project': {
       const { data: f } = await db.from('folders').select('*').eq('id', String(a.project_id)).maybeSingle()
       if (!f || (f.owner_id !== ctx.userId && f.visibility !== 'team')) throw new Error('Project niet gevonden')
       const patch: Json = {}
       if (a.name) patch.name = String(a.name)
-      if (a.website !== undefined) patch.website = String(a.website || '') || null
-      if (a.color) patch.color = String(a.color)
-      if (a.share_with_team !== undefined) { if (f.owner_id !== ctx.userId) throw new Error('Alleen de eigenaar kan de zichtbaarheid aanpassen'); patch.visibility = a.share_with_team ? 'team' : 'private' }
-      await db.from('folders').update(patch).eq('id', f.id)
-      return ok('Project bijgewerkt')
+      if (a.website !== undefined) patch.website = normSite(a.website)
+      if (a.color) patch.color = normColor(a.color)
+      const vis = a.visibility !== undefined ? (a.visibility === 'private' ? 'private' : 'team') : a.share_with_team !== undefined ? (a.share_with_team ? 'team' : 'private') : undefined
+      if (vis && vis !== f.visibility) { if (f.owner_id !== ctx.userId) throw new Error('Alleen de maker van het project kan de zichtbaarheid aanpassen'); patch.visibility = vis }
+      if (Object.keys(patch).length) { patch.updated_at = new Date().toISOString(); const { error } = await db.from('folders').update(patch).eq('id', f.id); if (error) throw new Error('Project bijwerken mislukt') }
+      return ok(await projectFull({ ...f, ...patch }, ctx))
     }
     case 'delete_project': {
       if (a.confirm !== true) throw new Error('Zet confirm op true, en alleen als de gebruiker dit expliciet vroeg')
@@ -1914,7 +1964,7 @@ BRIEF
 - Begin ALTIJD met get_brief: dat geeft de brief van het ontwerp, de planning en de klantbrief van het project (afspraken, doelen, doelgroepen, budget, tone of voice, campagnes) met de website. Laat alles wat daar staat terugkomen in je ontwerp en teksten; verzin niets wat ermee in strijd is.
 - Hoort het ontwerp bij een campagne uit de klantbrief, neem dan het doel, de doelgroep en het kanaal van die campagne over en zet de planning (set_planning) op de looptijd van de campagne als die nog leeg is.
 - Budget schrijf je als bedrag plus periode: "€15 per dag", "€500 per maand", "€2.000 looptijd totaal".
-- Noemt de gebruiker afspraken of campagnes van de klant, leg ze vast met set_project_brief. De website van het project geeft ook de favicon die in de advertentievoorbeelden als profielfoto staat.
+- Noemt de gebruiker afspraken of campagnes van de klant, leg ze vast met set_project_brief. Nieuwe klant? Maak het project met create_project (naam, website, kleur, zichtbaarheid en meteen de klantbrief). get_project geeft alles van een project, inclusief campagne-id's om ze later bij te werken. De website van het project geeft ook de favicon die in de advertentievoorbeelden als profielfoto staat.
 - Elk ontwerp heeft een brief (get_design geeft hem terug): doelgroep, budget, campagnedoelstelling, landingspagina, vorm, koppen en teksten. Lees hem vóór je ontwerpt: de vorm bepaalt de opbouw (Carrousel = meerdere kaarten in hetzelfde formaat, Story of Reel = 1080×1920 met veilige zones), de landingspagina en het doel bepalen de boodschap en call to action.
 - Noemt de gebruiker zulke instellingen, of schrijf je koppen en teksten, zet ze dan met set_brief in de brief. De klant ziet de brief in de feedbacklink; houd interne zaken zoals budget met internal verborgen als de gebruiker dat wil.
 - Gebruik de koppen en teksten uit de brief letterlijk in het ontwerp als die er staan.
