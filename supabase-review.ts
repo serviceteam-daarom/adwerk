@@ -47,7 +47,10 @@ Deno.serve(async (req) => {
     db.from('share_links').update({ last_used_at: new Date().toISOString() }).eq('id', link.id).then(() => {})
     const { data: cs } = await db.from('comments').select('*').eq('design_id', design.id).order('created_at')
     const names = await loadNames((cs || []).map((c: { author_id: string }) => c.author_id))
-    return json({ design: { id: design.id, title: design.title, frames: design.data?.frames || [], updated_at: design.updated_at }, can_comment: link.can_comment, comments: (cs || []).map((c: Record<string, unknown>) => publicComment(c, names)) })
+    // brief: alleen als die zichtbaar is voor de klant, zonder interne velden
+    const b = design.data?.brief as { showClient?: boolean; fields?: { hidden?: boolean }[] } | undefined
+    const brief = b && b.showClient !== false ? { fields: (b.fields || []).filter((f) => !f.hidden) } : null
+    return json({ design: { id: design.id, title: design.title, frames: design.data?.frames || [], updated_at: design.updated_at, brief }, can_comment: link.can_comment, comments: (cs || []).map((c: Record<string, unknown>) => publicComment(c, names)) })
   }
 
   if (b.action === 'comment') {

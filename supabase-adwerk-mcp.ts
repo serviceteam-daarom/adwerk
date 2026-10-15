@@ -393,7 +393,8 @@ type Json = Record<string, unknown>
 interface El { id: string; type: string; name: string; x: number; y: number; width: number; height: number; rotation: number; opacity: number; visible: boolean; locked: boolean; fill: string; stroke: string; strokeWidth: number; cornerRadius: number; shadow: Json; blend: string; anim?: { in: { type: string; delay: number; duration: number }; out: { type: string; delay: number; duration: number }; emph: { type: string; speed: number } }; [k: string]: unknown }
 interface Frame { id: string; name: string; w: number; h: number; platform: string; background: { type: string; color: string; color2: string; angle: number; src?: string }; elements: El[]; duration: number; safeZone?: boolean; groups?: Grp[] }
 interface Grp { id: string; name: string; anim?: El['anim'] }
-interface Doc { version: 1; frames: Frame[]; colors?: string[] }
+interface BriefField { id: string; label: string; kind: string; value: string; items?: string[]; hidden?: boolean; preset?: string }
+interface Doc { version: 1; frames: Frame[]; colors?: string[]; brief?: { fields: BriefField[]; showClient?: boolean } }
 interface Ctx { userId: string; agentName: string; agentKey: string }
 
 const uid = () => crypto.randomUUID().replace(/-/g, '').slice(0, 10)
@@ -459,7 +460,7 @@ function textHeight(text: string, width: number, fontSize: number, lineHeight: n
 
 /* ------------------------------------------------------------------ patches (zelfde formaat als de app) */
 interface FramePatch { id: string; meta?: Json; full?: Frame; upserts?: El[]; deletes?: string[]; order?: string[] }
-interface DocPatch { frameOrder?: string[]; removed?: string[]; frames: FramePatch[] }
+interface DocPatch { frameOrder?: string[]; removed?: string[]; frames: FramePatch[]; brief?: Doc['brief'] | null }
 const META = ['name', 'w', 'h', 'platform', 'background', 'duration', 'safeZone', 'groups'] as const
 function diffDocs(a: Doc, b: Doc): DocPatch | null {
   const patch: DocPatch = { frames: [] }
@@ -468,6 +469,7 @@ function diffDocs(a: Doc, b: Doc): DocPatch | null {
   if (bIds.join() !== a.frames.map((f) => f.id).join()) patch.frameOrder = bIds
   const removed = a.frames.filter((f) => !bIds.includes(f.id)).map((f) => f.id)
   if (removed.length) patch.removed = removed
+  if (JSON.stringify(a.brief ?? null) !== JSON.stringify(b.brief ?? null)) patch.brief = b.brief ?? null
   for (const f of b.frames) {
     const pf = aMap.get(f.id)
     if (!pf) { patch.frames.push({ id: f.id, full: f }); continue }
@@ -486,7 +488,7 @@ function diffDocs(a: Doc, b: Doc): DocPatch | null {
     if (hasNew || !same) fp.order = ids
     if (fp.meta || fp.upserts || fp.deletes || fp.order) patch.frames.push(fp)
   }
-  return patch.frames.length || patch.frameOrder || patch.removed ? patch : null
+  return patch.frames.length || patch.frameOrder || patch.removed || patch.brief !== undefined ? patch : null
 }
 
 /* ------------------------------------------------------------------ realtime: live bij collega's */
@@ -706,6 +708,22 @@ function applyAnimArgs(cur: El['anim'] | undefined, a: Json) {
   if (o) an.out = { type: IN_ANIMS.includes(String(o.type)) ? String(o.type) : an.out.type, delay: nm(o.delay, an.out.delay), duration: nm(o.duration, an.out.duration) }
   if (m) an.emph = { type: EMPH_ANIMS.includes(String(m.type)) ? String(m.type) : an.emph.type, speed: nm(m.speed, an.emph.speed) }
   return an
+}
+
+
+/* ------------------------------------------------------------------ brief (instellingen per ontwerp) */
+const BRIEF_PRESETS = [['doelgroep', 'Doelgroep', 'text'], ['budget', 'Budget', 'text'], ['doel', 'Campagnedoelstelling', 'text'], ['landing', 'Landingspagina', 'url'], ['vorm', 'Vorm', 'text'], ['koppen', 'Koppen', 'list'], ['teksten', 'Teksten', 'list']] as const
+const defaultBrief = () => ({ showClient: true, fields: BRIEF_PRESETS.map(([k, l, kind]) => ({ id: 'p-' + k, label: l, kind, value: '', preset: k, ...(kind === 'list' ? { items: [''] } : {}) })) as BriefField[] })
+function briefOut(doc: Doc) {
+  const b = doc.brief
+  if (!b) return { leeg: true, tip: 'Nog geen brief. Vul hem met set_brief als de gebruiker doelgroep, budget, doel, landingspagina, vorm, koppen of teksten noemt.' }
+  const o: Json = { zichtbaar_voor_klant: b.showClient !== false }
+  for (const f of b.fields) {
+    const v = f.kind === 'list' ? (f.items || []).filter((x) => x.trim()) : f.value
+    if ((Array.isArray(v) && !v.length) || v === '') continue
+    o[f.label] = f.hidden ? { waarde: v, intern: true } : v
+  }
+  return o
 }
 
 /* ------------------------------------------------------------------ uitvoer naar de agent */
@@ -950,6 +968,7 @@ const TOOLS: { name: string; description: string; inputSchema: { type: string; p
   { name: 'duplicate_element', description: 'Dupliceert een element, optioneel verschoven of naar een ander formaat (meegeschaald).', inputSchema: { type: 'object', properties: { design_id: DESIGN, element_id: S.str('Element'), dx: S.num('Verschuiving x'), dy: S.num('Verschuiving y'), to_frame_id: S.str('Naar dit formaat kopiëren') }, required: ['design_id', 'element_id'] } },
   { name: 'align_elements', description: 'Lijnt elementen en groepen uit: left, center, right, top, middle, bottom. ids mogen element-id\'s en group_id\'s zijn; een groep telt als één blok en blijft intact. relative_to: selection (onderling, standaard bij 2 of meer blokken) of frame (op het formaat, standaard bij 1 blok; met margin).', inputSchema: { type: 'object', properties: { design_id: DESIGN, element_ids: { type: 'array', items: { type: 'string' }, description: 'Element- en/of groep-id\'s' }, align: { type: 'string', enum: ['left', 'center', 'right', 'top', 'middle', 'bottom'] }, relative_to: { type: 'string', enum: ['frame', 'selection'] }, margin: S.num('Marge tot de rand bij relative_to frame') }, required: ['design_id', 'element_ids', 'align'] } },
   { name: 'distribute_elements', description: 'Verdeelt elementen en groepen (een groep = één blok) horizontaal of verticaal. Zonder spacing: gelijke tussenruimte tussen eerste en laatste (minstens 3 blokken). Met spacing: vaste ruimte in px vanaf het eerste blok (minstens 2).', inputSchema: { type: 'object', properties: { design_id: DESIGN, element_ids: { type: 'array', items: { type: 'string' } }, axis: { type: 'string', enum: ['horizontal', 'vertical'] }, spacing: S.num('Vaste tussenruimte in px (optioneel)') }, required: ['design_id', 'element_ids', 'axis'] } },
+  { name: 'set_brief', description: 'Vult de brief (instellingen) van een ontwerp, zichtbaar in de editor onder Brief en voor de klant in de feedbacklink. Standaardvelden: Doelgroep, Budget, Campagnedoelstelling, Landingspagina, Vorm (bijv. Enkele afbeelding, Carrousel, Video, Story of Reel, HTML5-banner, GIF), Koppen (lijst, max ~40 tekens) en Teksten (lijst, ~125 tekens zichtbaar). Elk ander label maakt een nieuw veld. Een array als waarde wordt een lijst. Bestaande velden worden op label gevonden en overschreven; lege string wist. Met internal houd je velden (zoals budget) verborgen voor de klant.', inputSchema: { type: 'object', properties: { design_id: DESIGN, values: { type: 'object', description: 'Label -> tekst of lijst met teksten, bijv. {"Doelgroep": "Remarketing websitebezoekers", "Budget": "€15 per dag", "Koppen": ["...", "..."]}' }, internal: { type: 'array', items: { type: 'string' }, description: 'Labels die alleen intern zichtbaar zijn' }, public: { type: 'array', items: { type: 'string' }, description: 'Labels die weer zichtbaar worden voor de klant' }, remove: { type: 'array', items: { type: 'string' }, description: 'Labels van velden die weg moeten' }, show_client: S.bool('Brief wel of niet tonen in de feedbacklink') }, required: ['design_id'] } },
   { name: 'group_elements', description: 'Groepeert elementen (minstens 2, in hetzelfde formaat) tot één groep, bijvoorbeeld knopvlak + knoptekst, of logo + pay-off. Een groep beweegt, schaalt en animeert samen; in de editor selecteer je hem met één klik. De leden komen direct op elkaar te liggen in de laagvolgorde. Bestaande groepen in de selectie worden samengevoegd. Geeft group_id terug.', inputSchema: { type: 'object', properties: { design_id: DESIGN, element_ids: { type: 'array', items: { type: 'string' } }, name: S.str('Naam, bijv. "Knop" of "Logo met pay-off"') }, required: ['design_id', 'element_ids'] } },
   { name: 'ungroup', description: 'Heft een groep op; de elementen blijven staan. Een groepsanimatie vervalt.', inputSchema: { type: 'object', properties: { design_id: DESIGN, group_id: S.str('Groep') }, required: ['design_id', 'group_id'] } },
   { name: 'update_group', description: 'Past een groep als geheel aan: naam, positie (x/y = linksboven van de groep, of dx/dy verschuiven), schalen (scale, rond het midden; tekst schaalt mee), zichtbaar, vergrendeld, of laagvolgorde (arrange: front of back).', inputSchema: { type: 'object', properties: { design_id: DESIGN, group_id: S.str('Groep'), name: S.str('Nieuwe naam'), x: S.num('Linkerkant'), y: S.num('Bovenkant'), dx: S.num('Verschuiving x'), dy: S.num('Verschuiving y'), scale: S.num('Schaal, bijv. 1.2'), visible: S.bool('Zichtbaar'), locked: S.bool('Vergrendeld'), arrange: { type: 'string', enum: ['front', 'back'] } }, required: ['design_id', 'group_id'] } },
@@ -998,7 +1017,7 @@ async function call(name: string, a: Json, ctx: Ctx) {
 
     case 'get_design': {
       const d = await loadDesign(String(a.design_id), ctx)
-      return ok({ id: d.id, title: d.title, url: designUrl(d.id), frames: summarize(d.data) })
+      return ok({ id: d.id, title: d.title, url: designUrl(d.id), brief: briefOut(d.data), frames: summarize(d.data) })
     }
 
     case 'create_design': {
@@ -1402,6 +1421,33 @@ async function call(name: string, a: Json, ctx: Ctx) {
       return ok(info)
     }
 
+    case 'set_brief': {
+      const id = String(a.design_id)
+      const live = new Live(id, ctx, '')
+      await live.status('brief invullen')
+      let out: Json = {}
+      await editDesign(id, ctx, (doc) => {
+        const b = doc.brief || defaultBrief()
+        const find = (label: string) => b.fields.find((f) => f.label.toLowerCase() === label.trim().toLowerCase())
+        for (const [label, v] of Object.entries((a.values || {}) as Json)) {
+          let f = find(label)
+          const isList = Array.isArray(v)
+          if (!f) { f = { id: uid(), label: label.trim(), kind: isList ? 'list' : /^https?:\/\//.test(String(v)) ? 'url' : String(v).length > 90 ? 'longtext' : 'text', value: '' }; b.fields.push(f) }
+          if (isList) { f.kind = f.kind === 'list' ? 'list' : 'list'; f.items = (v as unknown[]).map((x) => String(x)); if (!f.items.length) f.items = [''] }
+          else if (f.kind === 'list') f.items = String(v).split(/\n+/).filter(Boolean)
+          else f.value = String(v ?? '')
+        }
+        for (const l of (a.internal || []) as string[]) { const f = find(l); if (f) f.hidden = true }
+        for (const l of (a.public || []) as string[]) { const f = find(l); if (f) delete f.hidden }
+        for (const l of (a.remove || []) as string[]) b.fields = b.fields.filter((f) => f.label.toLowerCase() !== l.trim().toLowerCase())
+        if (typeof a.show_client === 'boolean') b.showClient = a.show_client
+        doc.brief = b
+        out = briefOut(doc)
+      })
+      await live.status('klaar')
+      return ok({ brief: out })
+    }
+
     /* ---------------- groepen */
     case 'group_elements': {
       const id = String(a.design_id), ids = (a.element_ids || []) as string[]
@@ -1746,6 +1792,11 @@ FOTO'S (de meest gemaakte fouten)
 - Gebruik een mask (circle, arch) alleen als het onderwerp er ruim in past.
 - Geen tekst over gezichten of het product. Tekst op een foto: zet een vlak of donker verloop eronder of kies een rustig deel van de foto.
 - Vergroot kleine foto's niet sterk op (wazig). Voorkom dat een foto als achtergrond de tekst onleesbaar maakt.
+
+BRIEF
+- Elk ontwerp heeft een brief (get_design geeft hem terug): doelgroep, budget, campagnedoelstelling, landingspagina, vorm, koppen en teksten. Lees hem vóór je ontwerpt: de vorm bepaalt de opbouw (Carrousel = meerdere kaarten in hetzelfde formaat, Story of Reel = 1080×1920 met veilige zones), de landingspagina en het doel bepalen de boodschap en call to action.
+- Noemt de gebruiker zulke instellingen, of schrijf je koppen en teksten, zet ze dan met set_brief in de brief. De klant ziet de brief in de feedbacklink; houd interne zaken zoals budget met internal verborgen als de gebruiker dat wil.
+- Gebruik de koppen en teksten uit de brief letterlijk in het ontwerp als die er staan.
 
 GROEPEREN EN UITLIJNEN
 - Groepeer elementen die bij elkaar horen met group_elements: knopvlak + knoptekst, logo + pay-off, prijsbadge + prijs, icoon + label. Geef de groep een herkenbare naam ("Knop", "Prijsbadge").
