@@ -207,34 +207,112 @@ function pathFor(font: opentype.Font, s: string, x: number, y: number, fs: numbe
   glyphs.forEach((g: opentype.Glyph, i: number) => { d += g.getPath(cx, y, fs).toPathData(2); cx += (g.advanceWidth || 0) * k + ls; if (i < glyphs.length - 1) cx += font.getKerningValue(g, glyphs[i + 1]) * k })
   return d
 }
-/** Zelfde opmaak als het canvas: woordafbreking, regelafstand, uitlijning, en kleiner als één woord niet past. */
-async function layoutText(el: AnyEl) {
-  const font = await loadFont(el.fontFamily || 'Poppins', el.fontWeight || 400, !!el.italic)
-  const text = String(el.uppercase ? (el.text || '').toUpperCase() : el.text || '')
-  const ls = el.letterSpacing || 0, w = el.width
-  let fs = el.fontSize || 24
-  const words = text.split(/\s+/).filter(Boolean)
-  if (words.length) { const widest = Math.max(...words.map((x) => advance(font, x, fs, ls))); if (widest > w && w > 0) fs = Math.max(4, fs * (w / widest) * 0.98) }
-  const lines: string[] = []
-  for (const para of text.split('\n')) {
-    let line = ''
-    for (const word of para.split(' ')) {
-      const test = line ? line + ' ' + word : word
-      if (line && advance(font, test, fs, ls) > w) { lines.push(line); line = word } else line = test
-    }
-    lines.push(line)
+/* ---------- tekst met opmaak per stukje (zelfde regels als de app) ---------- */
+export type Run = { t: string; b?: 1 | 0; i?: 1 | 0; u?: 1 | 0; c?: string }
+const runKey = (r: Run) => `${r.b ?? ''}|${r.i ?? ''}|${r.u ?? ''}|${r.c || ''}`
+function normalizeRuns(runs?: Run[]): Run[] | undefined {
+  if (!runs?.length) return undefined
+  const out: Run[] = []
+  for (const r of runs) {
+    if (!r?.t) continue
+    const c: Run = { t: String(r.t) }
+    if (r.b !== undefined && r.b !== null) c.b = r.b ? 1 : 0
+    if (r.i !== undefined && r.i !== null) c.i = r.i ? 1 : 0
+    if (r.u !== undefined && r.u !== null) c.u = r.u ? 1 : 0
+    if (r.c) c.c = String(r.c).toUpperCase()
+    const last = out[out.length - 1]
+    if (last && runKey(last) === runKey(c)) last.t += c.t; else out.push(c)
   }
-  const lh = fs * (el.lineHeight || 1.2)
-  const mid = ((font.ascender + font.descender) / 2) * (fs / font.unitsPerEm)
-  let d = '', under = ''
-  lines.forEach((ln, i) => {
-    const lw = advance(font, ln, fs, ls) - (ln ? ls : 0)
-    const x = el.align === 'center' ? (w - lw) / 2 : el.align === 'right' ? w - lw : 0
-    const base = lh * i + lh / 2 + mid
-    d += pathFor(font, ln, x, base, fs, ls)
-    if (el.underline && ln) under += `<rect x="${x.toFixed(1)}" y="${(base + fs * 0.12).toFixed(1)}" width="${lw.toFixed(1)}" height="${(fs * 0.06).toFixed(1)}"/>`
+  if (!out.length || out.every((r) => runKey(r) === '|||')) return undefined
+  return out
+}
+function charStyles(text: string, runs?: Run[]): Omit<Run, 't'>[] {
+  const out: Omit<Run, 't'>[] = []
+  if (runs) for (const r of runs) for (let k = 0; k < r.t.length; k++) { const { t: _t, ...st } = r; out.push(st) }
+  while (out.length < text.length) out.push({})
+  return out.slice(0, text.length)
+}
+function remapRuns(oldText: string, newText: string, runs?: Run[]): Run[] | undefined {
+  if (!runs || oldText === newText) return runs
+  const st = charStyles(oldText, runs)
+  let p = 0
+  while (p < oldText.length && p < newText.length && oldText[p] === newText[p]) p++
+  let s = 0
+  while (s < oldText.length - p && s < newText.length - p && oldText[oldText.length - 1 - s] === newText[newText.length - 1 - s]) s++
+  const inherit = st[p - 1] || st[p] || {}
+  const next = [...st.slice(0, p), ...Array(newText.length - p - s).fill(inherit), ...st.slice(oldText.length - s)]
+  return normalizeRuns(newText.split('').map((ch, k) => ({ t: ch, ...next[k] })))
+}
+function applyRunStyle(text: string, runs: Run[] | undefined, start: number, end: number, patch: { b?: boolean | null; i?: boolean | null; u?: boolean | null; c?: string | null }): Run[] | undefined {
+  const st = charStyles(text, runs).map((x, k) => {
+    if (k < start || k >= end) return x
+    const n = { ...x }
+    for (const key of ['b', 'i', 'u'] as const) if (key in patch) { const v = patch[key]; if (v === null || v === undefined) delete n[key]; else n[key] = v ? 1 : 0 }
+    if ('c' in patch) { if (patch.c) n.c = String(patch.c).toUpperCase(); else delete n.c }
+    return n
   })
-  return { d, under, height: Math.ceil(lines.length * lh), fontSize: fs, lines }
+  return normalizeRuns(text.split('').map((ch, k) => ({ t: ch, ...st[k] })))
+}
+function textSegments(text: string, runs?: Run[]): Run[] {
+  if (!runs?.length) return [{ t: text }]
+  const joined = runs.map((r) => r.t).join('')
+  return joined === text ? runs : remapRuns(joined, text, runs) || [{ t: text }]
+}
+const runWeight = (base: number, r: Omit<Run, 't'>) => (r.b === undefined ? base : r.b ? Math.min(900, Math.max(700, base + 200)) : Math.min(base, 400))
+
+/** Zelfde opmaak als het canvas: woordafbreking, regelafstand, uitlijning, kleiner als één woord niet past, en opmaak per woord. */
+async function layoutText(el: AnyEl) {
+  const base = el.fontWeight || 400, fam = el.fontFamily || 'Poppins'
+  const ls = el.letterSpacing || 0, W = el.width
+  const up = (x: string) => (el.uppercase ? x.toUpperCase() : x)
+  const styleOf = (r: Run) => ({ weight: runWeight(base, r), italic: r.i === undefined ? !!el.italic : !!r.i, underline: r.u === undefined ? !!el.underline : !!r.u, color: r.c || el.fill || '#000' })
+  const fonts = new Map<string, opentype.Font>()
+  const fontFor = async (r: Run) => { const s = styleOf(r); const k = `${s.weight}|${s.italic}`; if (!fonts.has(k)) fonts.set(k, await loadFont(fam, s.weight, s.italic)); return fonts.get(k)! }
+  type Tok = { kind: 'word' | 'space' | 'nl'; parts: { t: string; r: Run; f: opentype.Font }[] }
+  const toks: Tok[] = []
+  for (const r of textSegments(String(el.text || ''), el.runs as Run[] | undefined)) {
+    const f = await fontFor(r)
+    for (const m of r.t.match(/\n| +|[^ \n]+/g) || []) {
+      const kind = m === '\n' ? 'nl' : m[0] === ' ' ? 'space' : 'word'
+      const last = toks[toks.length - 1]
+      if (kind === 'word' && last?.kind === 'word') last.parts.push({ t: m, r, f }); else toks.push({ kind, parts: [{ t: m, r, f }] })
+    }
+  }
+  const tokW = (k: Tok, fs: number) => k.parts.reduce((a, p) => a + advance(p.f, up(p.t), fs, ls), 0)
+  let fs = el.fontSize || 24
+  const widest = Math.max(0, ...toks.filter((k) => k.kind === 'word').map((k) => tokW(k, fs)))
+  if (widest > W && W > 0) fs = Math.max(4, fs * (W / widest) * 0.98)
+  type Piece = { t: string; x: number; w: number; f: opentype.Font; r: Run }
+  const lines: { pieces: Piece[]; width: number }[] = []
+  let cur: { pieces: Piece[]; width: number } = { pieces: [], width: 0 }
+  let space: Tok | null = null
+  const push = (k: Tok) => { for (const p of k.parts) { const w = advance(p.f, up(p.t), fs, ls); cur.pieces.push({ t: up(p.t), x: cur.width, w, f: p.f, r: p.r }); cur.width += w } }
+  for (const k of toks) {
+    if (k.kind === 'nl') { lines.push(cur); cur = { pieces: [], width: 0 }; space = null; continue }
+    if (k.kind === 'space') { if (cur.pieces.length) space = k; continue }
+    const ww = tokW(k, fs), sw = space ? tokW(space, fs) : 0
+    if (cur.pieces.length && cur.width + sw + ww > W + 0.5) { lines.push(cur); cur = { pieces: [], width: 0 } } else if (space) push(space)
+    space = null
+    push(k)
+  }
+  lines.push(cur)
+  const lh = fs * (el.lineHeight || 1.2)
+  // per kleur één pad, zodat de SVG compact blijft
+  const byColor = new Map<string, { d: string; under: string }>()
+  lines.forEach((ln, i) => {
+    const x0 = el.align === 'center' ? (W - ln.width) / 2 : el.align === 'right' ? W - ln.width : 0
+    for (const p of ln.pieces) {
+      const s = styleOf(p.r)
+      const mid = ((p.f.ascender + p.f.descender) / 2) * (fs / p.f.unitsPerEm)
+      const y = lh * i + lh / 2 + mid
+      const o = byColor.get(s.color) || { d: '', under: '' }
+      o.d += pathFor(p.f, p.t, x0 + p.x, y, fs, ls)
+      if (s.underline) o.under += `<rect x="${(x0 + p.x).toFixed(1)}" y="${(y + fs * 0.12).toFixed(1)}" width="${p.w.toFixed(1)}" height="${(fs * 0.06).toFixed(1)}"/>`
+      byColor.set(s.color, o)
+    }
+  })
+  const fills = [...byColor.entries()].map(([color, o]) => ({ color, ...o }))
+  return { fills, d: fills.map((x) => x.d).join(''), height: Math.ceil(lines.length * lh), fontSize: fs, lines: lines.map((l) => l.pieces.map((p) => p.t).join('')) }
 }
 
 /* ---------- formaat naar SVG ---------- */
@@ -280,7 +358,7 @@ async function frameSvg(f: AnyFrame, t: number | null = null) {
       case 'text': {
         const L = await layoutText(el)
         h = L.height
-        inner = `<path d="${L.d}" fill="${fill}"${stroke}/>${L.under ? `<g fill="${fill}">${L.under}</g>` : ''}`
+        inner = L.fills.map((x) => `<path d="${x.d}" fill="${x.color}"${stroke}/>${x.under ? `<g fill="${x.color}">${x.under}</g>` : ''}`).join('')
         break
       }
       case 'ellipse': inner = `<ellipse cx="${w / 2}" cy="${h / 2}" rx="${w / 2}" ry="${h / 2}" fill="${fill}"${stroke}/>`; break
@@ -450,6 +528,33 @@ function baseEl(type: string, name: string, patch: Partial<El>): El {
     ...patch,
   } as El
 }
+
+/** Opmaak per woord: ranges = [{match, occurrence, start, end, bold, italic, underline, color}] op de tekst van een element. */
+function styleRanges(text: string, runs: Run[] | undefined, ranges: Json[]) {
+  const applied: Json[] = []
+  for (const r of ranges || []) {
+    const patch: { b?: boolean | null; i?: boolean | null; u?: boolean | null; c?: string | null } = {}
+    if ('bold' in r) patch.b = r.bold === null ? null : !!r.bold
+    if ('italic' in r) patch.i = r.italic === null ? null : !!r.italic
+    if ('underline' in r) patch.u = r.underline === null ? null : !!r.underline
+    if ('color' in r) patch.c = r.color ? normHex(r.color) : null
+    if (r.reset) { patch.b = null; patch.i = null; patch.u = null; patch.c = null }
+    const spans: [number, number][] = []
+    if (typeof r.match === 'string' && r.match) {
+      const hay = r.case_sensitive ? text : text.toLowerCase(), needle = r.case_sensitive ? String(r.match) : String(r.match).toLowerCase()
+      const all: number[] = []
+      for (let i = hay.indexOf(needle); i >= 0; i = hay.indexOf(needle, i + needle.length)) all.push(i)
+      const occ = r.occurrence === 'all' || r.occurrence === 0 ? all : [all[Math.max(1, Number(r.occurrence) || 1) - 1]].filter((x) => x !== undefined)
+      for (const i of occ) spans.push([i, i + needle.length])
+      if (!spans.length) { applied.push({ match: r.match, error: 'niet gevonden in de tekst' }); continue }
+    } else if (typeof r.start === 'number') spans.push([Math.max(0, r.start), Math.min(text.length, typeof r.end === 'number' ? r.end : text.length)])
+    else spans.push([0, text.length])
+    for (const [a, b] of spans) runs = applyRunStyle(text, runs, a, b, patch)
+    applied.push({ match: r.match ?? text.slice(spans[0][0], spans[0][1]), count: spans.length })
+  }
+  return { runs: normalizeRuns(runs), applied }
+}
+const RANGE_SCHEMA = { type: 'array', description: 'Opmaak voor delen van de tekst. Per item: match (stuk tekst) met optioneel occurrence (1 = eerste, "all" = overal), of start/end (tekenposities). Daarbij bold, italic, underline (true/false; null = zoals het tekstvak) en/of color (hex; null = tekstkleur van het vak). reset: true haalt alle eigen opmaak van dat stuk weg.', items: { type: 'object', properties: { match: { type: 'string' }, occurrence: {}, case_sensitive: { type: 'boolean' }, start: { type: 'number' }, end: { type: 'number' }, bold: { type: 'boolean' }, italic: { type: 'boolean' }, underline: { type: 'boolean' }, color: { type: 'string' }, reset: { type: 'boolean' } } } }
 
 /** Tekstblok: hoogte schatten (het canvas meet het daarna exact). */
 function textHeight(text: string, width: number, fontSize: number, lineHeight: number) {
@@ -1062,12 +1167,13 @@ const TOOLS: { name: string; description: string; inputSchema: { type: string; p
   { name: 'add_format', description: 'Voegt een formaat toe aan een ontwerp. Met copy_from_frame_id wordt de inhoud van dat formaat slim meegeschaald.', inputSchema: { type: 'object', properties: { design_id: DESIGN, format: S.str('Format-key (list_formats)'), width: S.num('Eigen breedte'), height: S.num('Eigen hoogte'), name: S.str('Naam bij eigen formaat'), copy_from_frame_id: S.str('Inhoud kopiëren van dit formaat') }, required: ['design_id'] } },
   { name: 'set_frame', description: 'Past instellingen van een formaat aan: naam, animatieduur (seconden, max 30 voor Google Ads) en veilige zones.', inputSchema: { type: 'object', properties: { design_id: DESIGN, frame_id: FRAME, name: S.str('Naam'), duration: S.num('Duur van de animatie in seconden'), safe_zone: S.bool('Veilige zones voor stories tonen') }, required: ['design_id'] } },
   { name: 'set_background', description: 'Achtergrond van een of alle formaten: effen kleur, kleurverloop of foto (URL wordt opgeslagen in Adwerk).', inputSchema: { type: 'object', properties: { design_id: DESIGN, frame_id: FRAME, type: { type: 'string', enum: ['solid', 'gradient', 'image'] }, color: S.str('Hex-kleur, bijv. #1B213B'), color2: S.str('Tweede kleur bij verloop'), angle: S.num('Hoek van het verloop in graden'), image_url: S.str('Foto-URL of data-URL bij type image') }, required: ['design_id'] } },
-  { name: 'add_text', description: `Voegt een tekstblok toe. Lettertypes: ${FONTS.join(', ')} of een andere Google Font.`, inputSchema: { type: 'object', properties: { design_id: DESIGN, frame_id: FRAME, text: S.str('De tekst; \\n voor een nieuwe regel'), ...BOX, font_size: S.num('Lettergrootte in px'), font_family: S.str('Lettertype (standaard Poppins)'), font_weight: S.num('400, 500, 600, 700, 800 of 900'), color: S.str('Hex-kleur'), align: { type: 'string', enum: ['left', 'center', 'right'] }, line_height: S.num('Regelafstand, bijv. 1.15'), letter_spacing: S.num('Letterafstand in px'), uppercase: S.bool('Hoofdletters'), italic: S.bool('Cursief'), name: S.str('Laagnaam') }, required: ['design_id', 'text'] } },
+  { name: 'add_text', description: `Voegt een tekstblok toe. Lettertypes: ${FONTS.join(', ')} of een andere Google Font.`, inputSchema: { type: 'object', properties: { design_id: DESIGN, frame_id: FRAME, text: S.str('De tekst; \\n voor een nieuwe regel'), ...BOX, font_size: S.num('Lettergrootte in px'), font_family: S.str('Lettertype (standaard Poppins)'), font_weight: S.num('400, 500, 600, 700, 800 of 900'), color: S.str('Hex-kleur'), align: { type: 'string', enum: ['left', 'center', 'right'] }, line_height: S.num('Regelafstand, bijv. 1.15'), letter_spacing: S.num('Letterafstand in px'), uppercase: S.bool('Hoofdletters'), italic: S.bool('Cursief'), name: S.str('Laagnaam'), styles: RANGE_SCHEMA }, required: ['design_id', 'text'] } },
   { name: 'add_shape', description: 'Voegt een vorm toe: rect, rounded, pill, ellipse, triangle, star, badge of line. Handig voor knoppen, vlakken en accenten.', inputSchema: { type: 'object', properties: { design_id: DESIGN, frame_id: FRAME, shape: { type: 'string', enum: ['rect', 'rounded', 'pill', 'ellipse', 'triangle', 'star', 'badge', 'line'] }, ...BOX, color: S.str('Vulkleur (hex)'), corner_radius: S.num('Afronding in px'), stroke_color: S.str('Randkleur'), stroke_width: S.num('Randdikte'), opacity: S.num('0 tot 1'), name: S.str('Laagnaam') }, required: ['design_id', 'shape'] } },
   { name: 'add_image', description: 'Bekijk de foto eerst met view_image. Zet een afbeelding op het canvas vanaf een URL of data-URL. Het beeld wordt opgeslagen in de uploads van de gebruiker. Zonder breedte/hoogte past het beeld in de juiste verhouding. Met mask krijg je een vorm (circle, arch, oval, leaf, blob).', inputSchema: { type: 'object', properties: { design_id: DESIGN, frame_id: FRAME, image_url: S.str('URL, data-URL of svg-code (begint met <svg). Svg wordt automatisch opgeschoond, krijgt een vaste maat en wordt gecontroleerd.'), ...BOX, mask: { type: 'string', enum: ['none', 'circle', 'arch', 'oval', 'leaf', 'blob'] }, corner_radius: S.num('Afronding'), focus_x: S.num('Focuspunt in de foto 0 tot 1 (uit view_image), bijv. tussen de ogen'), focus_y: S.num('Focuspunt 0 tot 1'), name: S.str('Laagnaam') }, required: ['design_id', 'image_url'] } },
   { name: 'add_icon', description: 'Zet een icoon uit 200.000+ open iconen (Iconify) op het canvas. Zoek eerst met search_icons.', inputSchema: { type: 'object', properties: { design_id: DESIGN, frame_id: FRAME, icon: S.str('Iconify-id, bijv. "ph:shopping-cart-bold"'), x: BOX.x, y: BOX.y, size: S.num('Grootte in px'), color: S.str('Kleur (hex) voor eenkleurige iconen') }, required: ['design_id', 'icon'] } },
   { name: 'search_icons', description: 'Zoekt open iconen (Engelse zoekwoorden werken het best). Geeft Iconify-id\'s terug voor add_icon.', inputSchema: { type: 'object', properties: { query: S.str('Zoekwoord, bijv. cart, phone, arrow'), pack: S.str('Optioneel pack-prefix, bijv. ph, tabler, lucide, mdi, logos'), limit: S.num('Max aantal (standaard 30)') }, required: ['query'] } },
-  { name: 'update_element', description: 'Past een element aan. Geef alleen de eigenschappen die veranderen, bijvoorbeeld {"x":120,"text":"Nu 20% korting","fill":"#EA5F39","fontSize":64}. Mogelijk: x, y, width, height, rotation, opacity, visible, locked, fill, stroke, strokeWidth, cornerRadius, text, fontFamily, fontSize, fontWeight, italic, underline, align, lineHeight, letterSpacing, uppercase, src, mask, cropZoom, cropX, cropY, flipX, flipY, name, shadow {enabled,color,blur,x,y,opacity}.', inputSchema: { type: 'object', properties: { design_id: DESIGN, element_id: S.str('Id van het element'), props: { type: 'object', description: 'De te wijzigen eigenschappen' } }, required: ['design_id', 'element_id', 'props'] } },
+  { name: 'update_element', description: 'Past een element aan. Geef alleen de eigenschappen die veranderen, bijvoorbeeld {"x":120,"text":"Nu 20% korting","fill":"#EA5F39","fontSize":64}. Mogelijk: x, y, width, height, rotation, opacity, visible, locked, fill, stroke, strokeWidth, cornerRadius, text, fontFamily, fontSize, fontWeight, italic, underline, align, lineHeight, letterSpacing, uppercase, src, mask, cropZoom, cropX, cropY, flipX, flipY, name, shadow {enabled,color,blur,x,y,opacity}, runs (opmaak per stukje: [{t,b,i,u,c}], samen precies de tekst; makkelijker via style_text). Bij een nieuwe tekst zonder runs schuift bestaande opmaak per woord mee.', inputSchema: { type: 'object', properties: { design_id: DESIGN, element_id: S.str('Id van het element'), props: { type: 'object', description: 'De te wijzigen eigenschappen' } }, required: ['design_id', 'element_id', 'props'] } },
+  { name: 'style_text', description: 'Opmaak binnen één tekstblok: losse woorden of zinsdelen vet, cursief, onderstreept of in een andere kleur, bijvoorbeeld {"match":"20% korting","bold":true,"color":"#EA5F39"}. De rest van de tekst houdt de opmaak van het tekstblok. Bij latere tekstwijzigingen via update_element schuift de opmaak mee. clear: true haalt eerst alle eigen opmaak weg.', inputSchema: { type: 'object', properties: { design_id: DESIGN, element_id: S.str('Id van het tekstelement'), ranges: RANGE_SCHEMA, clear: S.bool('Eerst alle opmaak per woord wissen') }, required: ['design_id', 'element_id'] } },
   { name: 'delete_element', description: 'Verwijdert een element.', inputSchema: { type: 'object', properties: { design_id: DESIGN, element_id: S.str('Id van het element') }, required: ['design_id', 'element_id'] } },
   { name: 'arrange_element', description: 'Verandert de laagvolgorde: front (helemaal voor), back (helemaal achter), forward of backward (één stap).', inputSchema: { type: 'object', properties: { design_id: DESIGN, element_id: S.str('Id'), position: { type: 'string', enum: ['front', 'back', 'forward', 'backward'] } }, required: ['design_id', 'element_id', 'position'] } },
   { name: 'animate_element', description: `Animatie voor een element (HTML5, GIF en video). In en uit: ${IN_ANIMS.join(', ')}. Nadruk (herhalend): ${EMPH_ANIMS.join(', ')}. Delay en duration in seconden.`, inputSchema: { type: 'object', properties: { design_id: DESIGN, element_id: S.str('Id'), in: { type: 'object', properties: { type: { type: 'string', enum: IN_ANIMS }, delay: S.num('Start na s'), duration: S.num('Duur s') } }, out: { type: 'object', properties: { type: { type: 'string', enum: IN_ANIMS }, delay: S.num('Seconden vóór het einde'), duration: S.num('Duur s') } }, emphasis: { type: 'object', properties: { type: { type: 'string', enum: EMPH_ANIMS }, speed: S.num('Snelheid, 1 = normaal') } } }, required: ['design_id', 'element_id'] } },
@@ -1247,6 +1353,7 @@ async function call(name: string, a: Json, ctx: Ctx) {
         })
         proto.x = num(a.x, Math.round((ref.w - width) / 2)); proto.y = num(a.y, Math.round(ref.h * 0.1))
         if (a.height) proto.height = num(a.height, proto.height)
+        if (Array.isArray(a.styles) && a.styles.length) { const r = styleRanges(text, undefined, a.styles as Json[]).runs; if (r) proto.runs = r }
       } else if (name === 'add_shape') {
         const shape = String(a.shape)
         const type = shape === 'rounded' || shape === 'pill' ? 'rect' : shape === 'badge' ? 'star' : shape
@@ -1326,7 +1433,7 @@ async function call(name: string, a: Json, ctx: Ctx) {
       live.pos = { x: el.x + el.width / 2 + 120, y: el.y + el.height / 2 + 160 }
       await live.moveTo(el.x + el.width / 2, el.y + el.height / 2, 'aanpassen')
       await live.click([elId])
-      const allowed = ['x', 'y', 'width', 'height', 'rotation', 'opacity', 'visible', 'locked', 'fill', 'stroke', 'strokeWidth', 'cornerRadius', 'text', 'fontFamily', 'fontSize', 'fontWeight', 'italic', 'underline', 'align', 'lineHeight', 'letterSpacing', 'uppercase', 'src', 'mask', 'cropZoom', 'cropX', 'cropY', 'flipX', 'flipY', 'name', 'shadow', 'points', 'innerRatio', 'blend', 'filters']
+      const allowed = ['x', 'y', 'width', 'height', 'rotation', 'opacity', 'visible', 'locked', 'fill', 'stroke', 'strokeWidth', 'cornerRadius', 'text', 'fontFamily', 'fontSize', 'fontWeight', 'italic', 'underline', 'align', 'lineHeight', 'letterSpacing', 'uppercase', 'src', 'mask', 'cropZoom', 'cropX', 'cropY', 'flipX', 'flipY', 'name', 'shadow', 'points', 'innerRatio', 'blend', 'filters', 'runs']
       const clean: Json = {}
       for (const [k, v] of Object.entries(props)) {
         const key = k === 'color' ? 'fill' : k.replace(/_([a-z])/g, (_, c) => c.toUpperCase())
@@ -1342,9 +1449,39 @@ async function call(name: string, a: Json, ctx: Ctx) {
         await sleep(420)
       }
       if (el.type === 'text' && typeof clean.text === 'string' && !('height' in clean)) clean.height = textHeight(String(clean.text), num(clean.width, el.width), num(clean.fontSize, Number(el.fontSize) || 24), num(clean.lineHeight, Number(el.lineHeight) || 1.15))
-      await editDesign(id, ctx, (doc) => { Object.assign(findEl(doc, elId).el, clean) })
+      await editDesign(id, ctx, (doc) => {
+        const t = findEl(doc, elId).el
+        const before = String(t.text || '')
+        Object.assign(t, clean)
+        if (t.type === 'text') {
+          if ('runs' in clean) t.runs = Array.isArray(clean.runs) ? normalizeRuns((clean.runs as Run[])) : undefined
+          else if (typeof clean.text === 'string' && t.runs) t.runs = remapRuns(before, String(clean.text), t.runs as Run[])
+          if (t.runs && (t.runs as Run[]).map((r) => r.t).join('') !== String(t.text || '')) t.runs = remapRuns((t.runs as Run[]).map((r) => r.t).join(''), String(t.text || ''), t.runs as Run[])
+          if (!t.runs) delete t.runs
+        }
+      })
       await live.status('klaar', [elId])
       return ok({ updated: elId, props: clean })
+    }
+
+    case 'style_text': {
+      const id = String(a.design_id), elId = String(a.element_id)
+      const row = await loadDesign(id, ctx)
+      const { frame, el } = findEl(row.data, elId)
+      if (el.type !== 'text') throw new Error('Dit element is geen tekst')
+      const live = new Live(id, ctx, frame.id)
+      live.pos = { x: el.x + el.width / 2 + 120, y: el.y + el.height / 2 + 160 }
+      await live.moveTo(el.x + el.width / 2, el.y + el.height / 2, 'tekst opmaken')
+      await live.click([elId])
+      let result: { runs?: Run[]; applied: Json[] } = { applied: [] }
+      await editDesign(id, ctx, (doc) => {
+        const t = findEl(doc, elId).el
+        const text = String(t.text || '')
+        result = styleRanges(text, a.clear ? undefined : (t.runs as Run[] | undefined), (Array.isArray(a.ranges) ? a.ranges : []) as Json[])
+        if (result.runs) t.runs = result.runs; else delete t.runs
+      })
+      await live.status('klaar', [elId])
+      return ok({ element_id: elId, applied: result.applied, runs: result.runs || [] })
     }
 
     case 'delete_element': {
@@ -2052,6 +2189,11 @@ FOTO'S (de meest gemaakte fouten)
 - Gebruik een mask (circle, arch) alleen als het onderwerp er ruim in past.
 - Geen tekst over gezichten of het product. Tekst op een foto: zet een vlak of donker verloop eronder of kies een rustig deel van de foto.
 - Vergroot kleine foto's niet sterk op (wazig). Voorkom dat een foto als achtergrond de tekst onleesbaar maakt.
+
+OPMAAK PER WOORD
+- Binnen één tekstblok kun je losse woorden of zinsdelen vet, cursief, onderstreept of in een andere kleur zetten: style_text met ranges, of direct styles bij add_text. Bijvoorbeeld een kop "Nu 20% korting op alles" met {"match":"20% korting","color":"#EA5F39"}.
+- Gebruik dit voor nadruk in de huisstijl (één accentwoord in de merkkleur, een vet getal), niet voor elke regel. Twee aparte tekstblokken voor één zin is niet nodig.
+- Collega's die het ontwerp open hebben zien het direct. In de editor kan de gebruiker zelf woorden selecteren en opmaken.
 
 STATUS EN VERSIES
 - Elk ontwerp heeft een status: concept, intern, klant, aanpassen, goedgekeurd, live, analyseren (get_design en list_designs tonen hem). Zet hem met set_status als de gebruiker dat vraagt, bijvoorbeeld "zet op interne check".
