@@ -649,6 +649,39 @@ async function importImage(src: string, ctx: Ctx, name?: string, shared = false)
   return { url, ...size }
 }
 
+/* ------------------------------------------------------------------ merksets */
+type Kit = { id: string; name: string; colors: string[]; fonts: string[]; logos: { url: string; name: string }[] }
+const normHex = (v: unknown) => { let c = String(v ?? '').trim(); if (!c.startsWith('#')) c = '#' + c; if (/^#[0-9a-f]{3}$/i.test(c)) c = '#' + c.slice(1).split('').map((x) => x + x).join(''); if (!/^#[0-9a-f]{6}$/i.test(c)) throw new Error(`Ongeldige kleur "${v}", gebruik een hexcode zoals #1A5FC4`); return c.toUpperCase() }
+const kitOut = (k: Kit) => ({ id: k.id, name: k.name, colors: k.colors, fonts: k.fonts, logos: k.logos, url: `${APP_URL}#/brand` })
+/** Leest de huisstijl van een website uit met dezelfde scan als de knop Scan in Adwerk (functie brand-scan). */
+async function scanSite(site: string, ctx: Ctx) {
+  const call = (key: string) => fetch(`${SB_URL}/functions/v1/brand-scan`, { method: 'POST', headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${key}`, apikey: key }, body: JSON.stringify({ url: site }) })
+  let r = await call(SRK)
+  const anon = Deno.env.get('SUPABASE_ANON_KEY')
+  if (r.status === 401 && anon) r = await call(anon)
+  const j = await r.json().catch(() => ({})) as { error?: string; name?: string; brandColors?: { hex: string }[]; neutralColors?: { hex: string }[]; fonts?: string[]; logos?: { score: number; source?: string; svg?: string; url?: string }[]; images?: string[] }
+  if (!r.ok || j.error) throw new Error(j.error || 'Website scannen mislukt')
+  const colors = [...(j.brandColors || []).slice(0, 6).map((c) => c.hex), ...(j.neutralColors || []).filter((c) => c.hex !== '#FFFFFF' && c.hex !== '#000000').slice(0, 1).map((c) => c.hex), '#FFFFFF'].map((c) => c.toUpperCase())
+  const fonts = (j.fonts || []).filter((f) => !/icon|awesome|symbol|dashicons|glyph|fontello|eicons|ionicons|feather/i.test(f)).slice(0, 3)
+  const logos: Kit['logos'] = []
+  const all = j.logos || []
+  const top = Math.max(0, ...all.map((x) => x.score))
+  const name = j.name || new URL(/^https?:/.test(site) ? site : 'https://' + site).hostname.replace(/^www\./, '')
+  for (const [i, l] of all.filter((x) => x.source !== 'icon' && x.score >= top * 0.6).slice(0, 3).entries()) {
+    try { const a = await importImage(l.svg || l.url!, ctx, `${name}-logo-${i + 1}${l.svg ? '.svg' : ''}`, true); logos.push({ url: a.url, name: `Logo ${i + 1}` }) } catch { /* overslaan */ }
+  }
+  for (const [i, u] of (j.images || []).slice(0, 4).entries()) {
+    try { const a = await importImage(u, ctx, `${name}-beeld-${i + 1}`, true); logos.push({ url: a.url, name: `Beeld ${i + 1}` }) } catch { /* overslaan */ }
+  }
+  return { name, colors, fonts, logos }
+}
+async function loadKit(id: string) {
+  if (id === 'daar-om-builtin') throw new Error('De merkset van daar-om.nl is vast en kan niet worden gewijzigd')
+  const { data } = await db.from('brand_kits').select('id,name,colors,fonts,logos').eq('id', id).maybeSingle()
+  if (!data) throw new Error('Merkset niet gevonden (list_brand_kits)')
+  return data as Kit
+}
+
 async function iconSvg(id: string): Promise<{ svg: string; multi: boolean }> {
   const [prefix, name] = id.split(':')
   if (!prefix || !name) throw new Error('Gebruik een Iconify-id zoals "ph:shopping-cart" (zoek met search_icons)')
@@ -1034,6 +1067,10 @@ const TOOLS: { name: string; description: string; inputSchema: { type: string; p
   { name: 'animate_element', description: `Animatie voor een element (HTML5, GIF en video). In en uit: ${IN_ANIMS.join(', ')}. Nadruk (herhalend): ${EMPH_ANIMS.join(', ')}. Delay en duration in seconden.`, inputSchema: { type: 'object', properties: { design_id: DESIGN, element_id: S.str('Id'), in: { type: 'object', properties: { type: { type: 'string', enum: IN_ANIMS }, delay: S.num('Start na s'), duration: S.num('Duur s') } }, out: { type: 'object', properties: { type: { type: 'string', enum: IN_ANIMS }, delay: S.num('Seconden vóór het einde'), duration: S.num('Duur s') } }, emphasis: { type: 'object', properties: { type: { type: 'string', enum: EMPH_ANIMS }, speed: S.num('Snelheid, 1 = normaal') } } }, required: ['design_id', 'element_id'] } },
   { name: 'add_to_library', description: 'Zet een afbeelding alleen in de uploads (niet op het canvas), optioneel gedeeld met het team.', inputSchema: { type: 'object', properties: { image_url: S.str('URL, data-URL of svg-code (begint met <svg). Svg wordt automatisch opgeschoond, krijgt een vaste maat en wordt gecontroleerd.'), name: S.str('Bestandsnaam'), shared: S.bool('Delen met team') }, required: ['image_url'] } },
   { name: 'list_brand_kits', description: 'Merksets van klanten (kleuren, lettertypes, logo-URL\'s) om in de huisstijl te ontwerpen.', inputSchema: { type: 'object', properties: {} } },
+  { name: 'get_brand_kit', description: 'Eén merkset met alle kleuren, lettertypes en logo\'s/beelden.', inputSchema: { type: 'object', properties: { kit_id: S.str('Merkset (list_brand_kits)') }, required: ['kit_id'] } },
+  { name: 'create_brand_kit', description: 'Maakt een merkset voor het hele team. Met website wordt de site automatisch gescand, net als de knop Scan in Adwerk: merkkleuren, lettertypes, logo\'s en beelden worden opgehaald en opgeslagen. Eigen kleuren, lettertypes en logo-URL\'s worden daaraan toegevoegd. Controleer daarna met get_brand_kit en ruim op met update_brand_kit wat niet klopt.', inputSchema: { type: 'object', properties: { name: S.str('Naam, bijv. klantnaam (standaard de naam van de site)'), website: S.str('Website van de klant om te scannen, bijv. www.klant.nl'), colors: { type: 'array', items: { type: 'string' }, description: 'Hexcodes' }, fonts: { type: 'array', items: { type: 'string' }, description: 'Lettertypes, eerste = koppen' }, logo_urls: { type: 'array', items: { type: 'string' }, description: 'URL\'s, data-URL\'s of svg-code van logo\'s' } } } },
+  { name: 'update_brand_kit', description: 'Wijzigt een merkset: naam, kleuren en lettertypes vervangen of toevoegen/verwijderen, logo\'s toevoegen (URL) of verwijderen (URL of naam), of de website opnieuw scannen en aanvullen.', inputSchema: { type: 'object', properties: { kit_id: S.str('Merkset'), name: S.str('Nieuwe naam'), colors: { type: 'array', items: { type: 'string' }, description: 'Vervangt alle kleuren' }, add_colors: { type: 'array', items: { type: 'string' } }, remove_colors: { type: 'array', items: { type: 'string' } }, fonts: { type: 'array', items: { type: 'string' }, description: 'Vervangt alle lettertypes (eerste = koppen)' }, add_fonts: { type: 'array', items: { type: 'string' } }, remove_fonts: { type: 'array', items: { type: 'string' } }, add_logo_urls: { type: 'array', items: { type: 'string' } }, remove_logos: { type: 'array', items: { type: 'string' }, description: 'URL of naam van logo/beeld' }, rescan_website: S.str('Website opnieuw scannen en wat ontbreekt toevoegen') }, required: ['kit_id'] } },
+  { name: 'delete_brand_kit', description: 'Verwijdert een merkset. Alleen op expliciet verzoek; confirm true.', inputSchema: { type: 'object', properties: { kit_id: S.str('Merkset'), confirm: S.bool('Moet true zijn') }, required: ['kit_id', 'confirm'] } },
   { name: 'list_assets', description: 'Afbeeldingen in de uploads van de gebruiker en de gedeelde teamuploads.', inputSchema: { type: 'object', properties: { shared: S.bool('Alleen gedeelde teamuploads') } } },
   // ---- kijken en controleren
   { name: 'get_preview', description: 'LIVE BEELD: geeft een afbeelding van één of alle formaten terug zoals ze er nu uitzien, plus een automatische controle op veelgemaakte fouten (contrast, te kleine tekst, buiten beeld, veilige zones, overlap, tekst op foto, te veel woorden). Heeft iemand het ontwerp open, dan is het beeld pixel-exact uit de editor. Gebruik dit na elke ontwerpstap en los alles op wat je ziet, tot het perfect is. Met time (seconden) zie je een moment uit de animatie.', inputSchema: { type: 'object', properties: { design_id: DESIGN, frame_id: S.str('Eén formaat; leeg = alle formaten (max 8)'), time: S.num('Moment in de animatie in seconden; leeg = eindbeeld'), size: S.num('Langste zijde van het beeld in px (200 tot 1400, standaard 900)'), checks: S.bool('Controle meesturen (standaard ja)') }, required: ['design_id'] } },
@@ -1362,6 +1399,47 @@ async function call(name: string, a: Json, ctx: Ctx) {
     case 'list_brand_kits': {
       const { data } = await db.from('brand_kits').select('id,name,colors,fonts,logos').order('name')
       return ok([{ id: 'daar-om-builtin', name: 'daar-om.nl', colors: ['#1B213B', '#1A5FC4', '#A2D6ED', '#E6A4FF', '#EA5F39'], fonts: ['Poppins', 'Caveat'], logos: [] }, ...(data || [])])
+    }
+
+    case 'get_brand_kit': {
+      if (a.kit_id === 'daar-om-builtin') return ok({ id: 'daar-om-builtin', name: 'daar-om.nl', colors: ['#1B213B', '#1A5FC4', '#A2D6ED', '#E6A4FF', '#EA5F39'], fonts: ['Poppins', 'Caveat'], logos: [] })
+      return ok(kitOut(await loadKit(String(a.kit_id))))
+    }
+    case 'create_brand_kit': {
+      let found: Awaited<ReturnType<typeof scanSite>> | null = null
+      if (a.website) found = await scanSite(String(a.website), ctx)
+      const name = String(a.name || found?.name || '').trim()
+      if (!name) throw new Error('Geef een naam of een website')
+      const colors = [...new Set([...(found?.colors || []), ...((a.colors || []) as string[]).map(normHex)])]
+      const fonts = [...new Set([...((a.fonts || []) as string[]).map(String), ...(found?.fonts || [])])]
+      const logos = [...(found?.logos || [])]
+      for (const [i, u] of ((a.logo_urls || []) as string[]).entries()) { const r = await importImage(String(u), ctx, `${name}-logo-extra-${i + 1}`, true); logos.push({ url: r.url, name: `Logo ${logos.length + 1}` }) }
+      const { data, error } = await db.from('brand_kits').insert({ name, colors, fonts, logos, owner_id: ctx.userId }).select('id,name,colors,fonts,logos').single()
+      if (error) throw new Error('Merkset opslaan mislukt: ' + error.message)
+      return ok({ ...kitOut(data as Kit), gescand: !!found, tip: 'Staat in Adwerk onder Merksets. Controleer de kleuren en logo\'s; verwijder wat niet bij de huisstijl hoort.' })
+    }
+    case 'update_brand_kit': {
+      const k = await loadKit(String(a.kit_id))
+      let colors = [...(k.colors || [])], fonts = [...(k.fonts || [])], logos = [...(k.logos || [])]
+      if (a.rescan_website) { const f = await scanSite(String(a.rescan_website), ctx); colors = [...new Set([...colors, ...f.colors])]; fonts = [...new Set([...fonts, ...f.fonts])]; const have = new Set(logos.map((l) => l.url)); logos.push(...f.logos.filter((l) => !have.has(l.url))) }
+      if (Array.isArray(a.colors)) colors = (a.colors as string[]).map(normHex)
+      for (const c of (a.add_colors || []) as string[]) { const h = normHex(c); if (!colors.includes(h)) colors.push(h) }
+      const rmC = new Set(((a.remove_colors || []) as string[]).map(normHex)); colors = colors.filter((c) => !rmC.has(c.toUpperCase()))
+      if (Array.isArray(a.fonts)) fonts = (a.fonts as string[]).map(String)
+      for (const f of (a.add_fonts || []) as string[]) if (!fonts.includes(String(f))) fonts.push(String(f))
+      const rmF = new Set(((a.remove_fonts || []) as string[]).map((x) => String(x).toLowerCase())); fonts = fonts.filter((f) => !rmF.has(f.toLowerCase()))
+      for (const [i, u] of ((a.add_logo_urls || []) as string[]).entries()) { const r = await importImage(String(u), ctx, `${k.name}-logo-${Date.now()}-${i}`, true); logos.push({ url: r.url, name: `Logo ${logos.length + 1}` }) }
+      const rmL = new Set(((a.remove_logos || []) as string[]).map((x) => String(x))); logos = logos.filter((l) => !rmL.has(l.url) && !rmL.has(l.name))
+      const patch = { name: a.name ? String(a.name) : k.name, colors, fonts, logos }
+      const { error } = await db.from('brand_kits').update(patch).eq('id', k.id)
+      if (error) throw new Error('Merkset bijwerken mislukt')
+      return ok(kitOut({ ...k, ...patch }))
+    }
+    case 'delete_brand_kit': {
+      if (a.confirm !== true) throw new Error('Zet confirm op true, en alleen als de gebruiker dit expliciet vroeg')
+      const k = await loadKit(String(a.kit_id))
+      await db.from('brand_kits').delete().eq('id', k.id)
+      return ok(`Merkset ${k.name} verwijderd`)
     }
 
     case 'list_assets': {
@@ -1938,7 +2016,7 @@ async function auth(req: Request): Promise<Ctx | null> {
 const INSTRUCTIONS = `Adwerk is de ontwerptool van daar-om.nl voor social ads, HTML5-bannersets en GIF's. Jij werkt live mee: wie het ontwerp open heeft, ziet jouw cursor en elke wijziging direct. Geef de gebruiker altijd de url van het ontwerp.
 
 WERKWIJZE
-1. Begrijp de opdracht: klant, doel (bereik, klikken, leads), doelgroep, kanaal en formaten. Haal de huisstijl op met list_brand_kits.
+1. Begrijp de opdracht: klant, doel (bereik, klikken, leads), doelgroep, kanaal en formaten. Haal de huisstijl op met list_brand_kits. Is er nog geen merkset voor de klant, maak hem dan met create_brand_kit en de website van de klant (wordt automatisch gescand) en controleer het resultaat met get_brand_kit.
 2. list_designs of create_design (een set: social, google, linkedin, demandgen). Zet het ontwerp in het project van de klant (create_design met project_id, of move_design). Projecten en ontwerpen zijn privé of gedeeld met het team. Lees daarna get_brief.
 3. Ontwerp eerst één hoofdformaat (meestal 1080×1080). Gebruik add_many om in één keer op te bouwen.
 4. Kijk ALTIJD met get_preview (of preview: true bij een tool) en los alles op wat de controle meldt én wat je zelf ziet. Herhaal tot het echt goed is. Stop nooit zonder een laatste get_preview van elk formaat.
